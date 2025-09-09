@@ -1,0 +1,97 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Atlan Support Copilot Design System - Dark Theme Professional UI */
+
+@layer base {
+  :root {
+    /* Dark theme base colors */
+    --background: 222 84% 4.9%;
+    --foreground: 210 40% 98%;
+
+    --card: 224 71% 4%;
+    --card-foreground: 210 40% 98%;
+
+    --popover: 224 71% 4%;
+    --popover-foreground: 210 40% 98%;
+
+    /* Brand colors - Professional blue accent */
+    --primary: 217 91% 60%;
+    --primary-foreground: 222 84% 4.9%;
+
+    --secondary: 215 28% 17%;
+    --secondary-foreground: 210 40% 98%;
+
+    --muted: 215 28% 17%;
+    --muted-foreground: 217 10% 64%;
+
+    --accent: 215 28% 17%;
+    --accent-foreground: 210 40% 98%;
+
+    --destructive: 0 63% 31%;
+    --destructive-foreground: 210 40% 98%;
+
+    --border: 215 28% 17%;
+    --input: 215 28% 17%;
+    --ring: 217 91% 60%;
+
+    --radius: 0.75rem;
+
+    /* Support ticket priority colors */
+    --priority-p0: 0 84% 60%;        /* Red - Critical */
+    --priority-p1: 43 96% 56%;       /* Amber - Medium */
+    --priority-p2: 215 14% 34%;      /* Gray - Low */
+    
+    /* Sentiment colors */
+    --sentiment-frustrated: 25 95% 53%;  /* Orange */
+    --sentiment-angry: 0 84% 60%;        /* Red */
+    --sentiment-curious: 217 91% 60%;    /* Blue */
+    --sentiment-neutral: 215 14% 34%;    /* Gray */
+    
+    /* Topic/tag colors */
+    --topic-default: 217 91% 60%;
+    --topic-connector: 142 71% 45%;
+    --topic-api: 271 81% 56%;
+    
+    /* Chat interface */
+    --chat-user: 217 91% 60%;
+    --chat-assistant: 215 28% 17%;
+    
+    /* Hover states */
+    --hover-card: 215 25% 22%;
+    --hover-muted: 215 25% 22%;
+
+    /* Sidebar */
+    --sidebar-background: 224 71% 4%;
+    --sidebar-foreground: 210 40% 98%;
+    --sidebar-primary: 217 91% 60%;
+    --sidebar-primary-foreground: 222 84% 4.9%;
+    --sidebar-accent: 215 28% 17%;
+    --sidebar-accent-foreground: 210 40% 98%;
+    --sidebar-border: 215 28% 17%;
+    --sidebar-ring: 217 91% 60%;
+
+    /* Animations */
+    --transition-smooth: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+    --transition-spring: all 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply bg-background text-foreground;
+  }
+  
+  /* Custom utilities for professional UI */
+  .line-clamp-2 {
+    overflow: hidden;
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+  }
+}

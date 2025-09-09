@@ -1,0 +1,86 @@
+# Global GitIgnore for Atlan Helpdesk Monorepo
+
+# --- Node / Frontend ---
+node_modules/
+.dist/
+dist/
+.next/
+.out/
+coverage/
+*.log
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+
+# Build artifacts
+frontend/dist/
+frontend/.vite/
+
+# --- Python / Backend ---
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+.eggs/
+.env
+.env.*
+.venv/
+venv/
+pytest_cache/
+.mypy_cache/
+.dmypy.json
+.pytest_cache/
+.cache/
+
+# Byte-compiled / optimized / DLL files
+backend/__pycache__/
+backend/venv/
+
+# Virtual environment
+venv/
+.envrc
+
+# IDE / Editor
+.vscode/
+!.vscode/extensions.json
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# OS / Misc
+Thumbs.db
+
+# Secrets / Service Accounts (DO NOT COMMIT REAL KEYS)
+serviceAccountKey.json
+backend/serviceAccountKey.json
+backend/*.json
+!backend/requirements.txt
+!frontend/package.json
+
+# Local data
+*.sqlite3
+
+# Logs
+logs/
+*.log
+
+# Coverage / Reports
+htmlcov/
+.coverage*
+
+# Generated
+backend/.pytest_cache/
+
+# Lockfiles (optional, keep if you want reproducibility)
+# bun.lockb
+
+# Firebase emulators
+.firebase/
+
+# Temporary
+*.tmp
+*.temp
+~$*
