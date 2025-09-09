@@ -445,24 +445,80 @@ def health():
 
 @app.post("/create_ticket", response_model=TicketResponse)
 def create_ticket(req: TicketCreateRequest, background: BackgroundTasks):
+	ticket_id = save_ticket(req.subject, req.body, req.initial_message)
+	background.add_task(
+		classify_and_update, ticket_id, f"Subject: {req.subject}\nBody: {req.body}"
+	)
+	return firestore_ticket_to_model(
+		db.collection(TICKETS_COLLECTION).document(ticket_id).get()
+	)
+
+def classify_and_update(ticket_doc_id: str, ticket_text: str):
+	"""Background task: classify the ticket and persist results (Feature 3).
+
+	ticket_text: Combined textual context (subject + body).
+	Produces JSON classification object with keys: topic_tags, sentiment, priority.
+	"""
+	if not AI_ENABLED:
+		return
+	# System-style instruction
+	prompt = f"""
+You are an assistant that classifies customer support tickets.
+Return ONLY valid JSON with keys: topic_tags (array of 1-5 concise lowercase tags), sentiment (one of: Positive, Neutral, Negative), priority (one of: 'P0 (High)','P1 (Medium)','P2 (Low)').
+If unsure, make a best-effort guess. No extra text.
+TICKET TEXT:\n{ticket_text}\nJSON:
+"""
+	classification: Dict[str, Any] = {
+		"topic_tags": [],
+		"sentiment": "Neutral",
+		"priority": "P2 (Low)",
+	}
+	try:
+		model = genai.GenerativeModel(MODEL_NAME)
+		resp = model.generate_content(prompt)
+		raw = resp.text or "{}"
+		start = raw.find("{")
+		end = raw.rfind("}")
+		if start != -1 and end != -1:
+			payload = raw[start : end + 1]
+			parsed = json.loads(payload)
+			# Merge validated fields
+			if isinstance(parsed.get("topic_tags"), list):
+				classification["topic_tags"] = parsed["topic_tags"][:5]
+			if parsed.get("sentiment") in {"Positive", "Neutral", "Negative"}:
+				classification["sentiment"] = parsed["sentiment"]
+			if parsed.get("priority") in {"P0 (High)", "P1 (Medium)", "P2 (Low)"}:
+				classification["priority"] = parsed["priority"]
+	except Exception:
+		# Keep defaults on failure
+		pass
+	# Persist using update_ticket helper for consistency
+	try:
+		update_ticket(ticket_doc_id, {"classification": classification})
+	except Exception:
+		pass
+
+
+def save_ticket(subject: str, body: str, initial_message: Optional[str]) -> str:
+	"""Persist a new ticket to Firestore and return its ID."""
 	ticket_id = generate_ticket_id()
-	created = now_ts()
+	ts = now_ts()
 	conversation = []
-	if req.initial_message:
+	if initial_message:
 		conversation.append(
 			{
 				"sender": "user",
-				"message": req.initial_message,
-				"timestamp": created,
+				"message": initial_message,
+				"timestamp": ts,
 			}
 		)
 	data = {
 		"id": ticket_id,
-		"subject": req.subject,
-		"body": req.body,
+		"subject": subject,
+		"body": body,
 		"status": "Open",
-		"createdAt": created,
-		"updatedAt": created,
+		"createdAt": ts,
+		"updatedAt": ts,
 		"classification": {
 			"topic_tags": [],
 			"sentiment": "Unknown",
@@ -471,20 +527,7 @@ def create_ticket(req: TicketCreateRequest, background: BackgroundTasks):
 		"conversation": conversation,
 	}
 	db.collection(TICKETS_COLLECTION).document(ticket_id).set(data)
-
-	# Background classification task
-	background.add_task(_classify_and_update_ticket, ticket_id, req.subject, req.body)
-
-	return firestore_ticket_to_model(
-		db.collection(TICKETS_COLLECTION).document(ticket_id).get()
-	)
-
-
-def _classify_and_update_ticket(ticket_id: str, subject: str, body: str):
-	classification = classify_ticket(subject, body)
-	ref = db.collection(TICKETS_COLLECTION).document(ticket_id)
-	if ref.get().exists:
-		ref.update({"classification": classification, "updatedAt": now_ts()})
+	return ticket_id
 
 
 # --------------------------- Agent Query -----------------------------------
