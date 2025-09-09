@@ -16,7 +16,7 @@ type ViewState =
   | { type: "ticket-detail"; ticket: Ticket };
 
 export default function Index() {
-  const { ticketsQuery, createTicket, creating } = useTickets();
+  const { ticketsQuery, createTicket, creating, deleteTicket, updateTicket } = useTickets();
   const [selectedTicket, setSelectedTicket] = useState<Ticket | null>(null);
   const ticketDetail = useTicketDetail(selectedTicket?.id);
   const [viewState, setViewState] = useState<ViewState>({ type: "chat" });
@@ -61,18 +61,20 @@ export default function Index() {
   };
 
   const handleUpdateTicket = (ticketId: string) => {
-    toast({
-      title: "Ticket Updated",
-      description: `Ticket ${ticketId} has been updated successfully.`
-    });
+    // Simple example: toggle status between Open & In-Progress
+    const t = tickets.find(t => t.id === ticketId);
+    const nextStatus = 'In-Progress';
+    updateTicket(ticketId, { status: nextStatus });
+    toast({ title: 'Ticket Updated', description: `Status set to ${nextStatus}.` });
   };
 
   const handleDeleteTicket = (ticketId: string) => {
-    toast({
-      title: "Ticket Deleted", 
-      description: `Ticket ${ticketId} has been deleted.`,
-      variant: "destructive"
-    });
+    deleteTicket(ticketId);
+    if (selectedTicket?.id === ticketId) {
+      setSelectedTicket(null);
+      setViewState({ type: 'chat' });
+    }
+    toast({ title: 'Ticket Deleted', description: `Ticket ${ticketId} removed.`, variant: 'destructive' });
   };
 
   const handleAskAI = (question: string, ticketId: string) => {

@@ -20,6 +20,9 @@ export interface AgentQueryResponse {
   reply: string;
   tool_calls?: any[];
   ticket_id?: string;
+  classification?: { topic_tags?: string[]; sentiment?: string; priority?: string };
+  used_urls?: string[];
+  routed?: boolean;
 }
 
 // API base URL: configurable via VITE_API_BASE (see .env.local). Default falls back to localhost.
@@ -54,6 +57,14 @@ export async function createTicket(subject: string, body: string): Promise<Backe
 
 export async function getTicket(id: string): Promise<BackendTicket> {
   return api<BackendTicket>(`/tickets/${id}`);
+}
+
+export async function deleteTicket(id: string): Promise<{deleted: boolean; ticket_id: string}> {
+  return api<{deleted: boolean; ticket_id: string}>(`/tickets/${id}`, { method: 'DELETE' });
+}
+
+export async function updateTicketFields(id: string, updates: Record<string, any>): Promise<any> {
+  return api<any>(`/tickets/${id}/update`, { method: 'POST', body: JSON.stringify(updates) });
 }
 
 export async function agentQuery(user_message: string, ticket_id?: string, conversation?: { sender: string; message: string; timestamp: number }[]): Promise<AgentQueryResponse> {

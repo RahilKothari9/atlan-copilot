@@ -6,6 +6,7 @@ import { Edit, Trash2, ArrowLeft, Send } from "lucide-react";
 import { useState } from "react";
 import { cn } from "@/lib/utils";
 import { Ticket } from "./TicketCard";
+import { TicketAnalysisPanel } from "./TicketAnalysisPanel";
 
 interface TicketDetailViewProps {
   ticket: Ticket;
@@ -101,6 +102,11 @@ export function TicketDetailView({
       {/* Ticket content */}
       <ScrollArea className="flex-1 p-4">
         <div className="space-y-6">
+          <TicketAnalysisPanel 
+            classification={{ topic_tags: ticket.topics.map(t=>t.toLowerCase()), sentiment: ticket.sentiment === 'Curious' ? 'Neutral' : ticket.sentiment, priority: ticket.priority === 'P0' ? 'P0 (High)' : ticket.priority === 'P1' ? 'P1 (Medium)' : 'P2 (Low)' }}
+            agentMessage={ticket.conversation?.find(m=>m.sender==='agent')?.message || null}
+            loading={!ticket.conversation || ticket.conversation.length===0}
+          />
           <div>
             <h3 className="text-sm font-medium text-foreground mb-2">Original Ticket</h3>
             <div className="bg-muted/30 rounded-md p-4 text-sm text-foreground leading-relaxed whitespace-pre-wrap">
@@ -110,7 +116,13 @@ export function TicketDetailView({
           <div>
             <h3 className="text-sm font-medium text-foreground mb-2">Conversation</h3>
             {(!ticket.conversation || ticket.conversation.length === 0) && (
-              <p className="text-xs text-muted-foreground">No messages yet.</p>
+              <p className="text-xs text-muted-foreground">
+                {(() => {
+                  const ragTopics = new Set(["How-to","Product","API/SDK","SSO","Best Practices"]);
+                  const hasRag = ticket.topics.some(t => ragTopics.has(t));
+                  return hasRag ? 'Generating AI answer from docs…' : 'No messages yet.';
+                })()}
+              </p>
             )}
             <div className="space-y-3">
               {ticket.conversation?.map((m, idx) => {

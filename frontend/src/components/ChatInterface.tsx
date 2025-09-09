@@ -59,7 +59,8 @@ export function ChatInterface({
             </div>
           )}
           
-          {messages.map((message) => (
+          {messages.map((message) => {
+            return (
             <div key={message.id} className={cn(
               "flex",
               message.type === "user" ? "justify-end" : "justify-start"
@@ -94,7 +95,7 @@ export function ChatInterface({
                 )}
               </div>
             </div>
-          ))}
+          )})}
           
           {isLoading && (
             <div className="flex justify-start">

@@ -121,6 +121,9 @@ class AgentQueryResponse(BaseModel):
 	reply: str
 	tool_calls: Optional[List[Dict[str, Any]]] = None
 	ticket_id: Optional[str] = None
+	classification: Optional[Dict[str, Any]] = None
+	used_urls: Optional[List[str]] = None
+	routed: Optional[bool] = None
 
 
 class TicketFilter(BaseModel):
@@ -165,7 +168,7 @@ def firestore_ticket_to_model(doc: firestore.DocumentSnapshot) -> TicketResponse
 
 
 # ----------------------------------------------------------------------------
-from tools import answer_with_rag  # Feature 4 RAG implementation
+from tools import list_doc_urls, answer_with_urls  # New dynamic doc tools
 try:  # Firestore FieldFilter (new style). Fallback to None if unavailable.
 	from google.cloud.firestore_v1 import FieldFilter  # type: ignore
 except Exception:  # pragma: no cover
@@ -239,7 +242,8 @@ def add_message_to_ticket(ticket_id: str, sender: str, message: str) -> Dict[str
 
 
 TOOL_REGISTRY = {
-	"answer_with_rag": answer_with_rag,
+	"list_doc_urls": list_doc_urls,
+	"answer_with_urls": answer_with_urls,
 	"fetch_tickets": fetch_tickets,
 	"update_ticket": update_ticket,
 	"delete_ticket": delete_ticket,
@@ -252,16 +256,33 @@ def _build_tool_declarations():
 		return None
 	fds = [
 		FunctionDeclaration(
-			name="answer_with_rag",
+			name="list_doc_urls",
 			description=(
-				"Use Retrieval-Augmented Generation over Atlan documentation (product) and developer hub (API/SDK). "
-				"Call this ONLY after you have a classification and only for topics: How-to, Product, Best practices, API/SDK, SSO. "
-				"Provide the original user question as 'question'. Returns an object containing an answer and a list of source URLs which MUST be cited in the final response."
+				"List slices of Atlan documentation URLs (product + developer). Use filter substring to narrow. "
+				"Call this BEFORE answer_with_urls to discover relevant URLs. Supports simple pagination via offset+limit."
 			),
 			parameters={
 				"type": "object",
-				"properties": {"question": {"type": "string", "description": "User question"}},
-				"required": ["question"],
+				"properties": {
+					"filter": {"type": "string", "description": "Optional substring filter (case-insensitive)"},
+					"limit": {"type": "integer", "description": "Max URLs to return (<=100)"},
+					"offset": {"type": "integer", "description": "Pagination offset"},
+				},
+			},
+		),
+		FunctionDeclaration(
+			name="answer_with_urls",
+			description=(
+				"Generate grounded answer using ONLY the provided URLs (docs.atlan.com / developer.atlan.com). "
+				"You MUST first narrow candidates with list_doc_urls, then pass at most 10 high-signal URLs here."
+			),
+			parameters={
+				"type": "object",
+				"properties": {
+					"question": {"type": "string"},
+					"urls": {"type": "array", "items": {"type": "string"}, "description": "Up to 10 selected URLs"},
+				},
+				"required": ["question", "urls"],
 			},
 		),
 		FunctionDeclaration(
@@ -332,10 +353,33 @@ def classify_ticket(subject: str, body: str) -> Dict[str, Any]:
 	"""Call Gemini to classify ticket. Returns classification dict."""
 	if not AI_ENABLED:
 		return {"topic_tags": [], "sentiment": "Neutral", "priority": "P2 (Low)"}
+	# Liberal RAG-oriented classification guidance: ALWAYS include a RAG-eligible topic tag
+	# (how-to, product, best practices, api/sdk, sso) FIRST when the query seeks steps, setup,
+	# configuration, integration, authentication, API usage, optimization, troubleshooting, or workflow guidance.
+	# If connector/vendor specific (e.g. snowflake, salesforce) AND the user asks how/steps/configure/connect/setup,
+	# include both 'how-to' (first) and the vendor or 'connector' tag.
+	# Use at most 3 tags. Approved special / RAG tags: how-to, product, best practices, api/sdk, sso.
+	# Other allowed contextual tags (use only if clearly central): connector, lineage, glossary, governance, security,
+	# sensitive data, cost, performance, catalog, data quality, access control.
+	# Examples:
+	#  - "How do I connect to Snowflake" -> ["how-to", "snowflake", "connector"]
+	#  - "Set up SSO with Okta" -> ["sso", "how-to"]
+	#  - "API token rotation best practice" -> ["api/sdk", "best practices"]
+	# Always ensure at least ONE of the RAG tags is present when instructional or informational.
 	prompt = f"""
-You are a ticket classification assistant. Analyze the ticket and output STRICT JSON with keys: topic_tags (array of 1-3 short tags), sentiment (one of: Positive, Neutral, Negative), priority (one of: 'P0 (High)', 'P1 (Medium)', 'P2 (Low)').
-Ticket Subject: {subject}\nTicket Body: {body}
-JSON:
+You classify support inputs. Return STRICT JSON only.
+Keys:
+  topic_tags: array (1-3) lowercase tags (prioritize RAG tags: how-to, product, best practices, api/sdk, sso when instructional / configuration / API / auth / optimization / setup / troubleshooting).
+  sentiment: one of Positive, Neutral, Negative.
+  priority: one of 'P0 (High)', 'P1 (Medium)', 'P2 (Low)'.
+Rules:
+  - If user asks how/steps/configure/setup/connect/integrate/authenticate/login/enable/install/add/create/use/rotate/renew => include 'how-to' first (or 'api/sdk' if purely about API syntax; still include 'how-to' if procedural).
+  - If mentions API, SDK, endpoint, token, key => include 'api/sdk'.
+  - If mentions SSO, SAML, Okta, Azure AD, OneLogin => include 'sso'.
+  - If "best practice" or optimization/tuning => include 'best practices'.
+  - Add vendor/connector tag (e.g. snowflake, salesforce) or 'connector' second if relevant.
+  - Never output duplicates; max 3 tags.
+INPUT SUBJECT:\n{subject}\nINPUT BODY:\n{body}\nJSON:
 """
 	try:
 		model = genai.GenerativeModel(MODEL_NAME)
@@ -359,15 +403,12 @@ JSON:
 	}
 
 
-CANON_TOPICS = [
-	"how-to","product","connector","lineage","api/sdk","sso","glossary","best practices","sensitive data"
-]
-
+CANON_TOPICS = ["how-to","product","connector","lineage","api/sdk","sso","glossary","best practices","sensitive data","governance","catalog","security","performance","cost","data quality"]
 RAG_TOPICS = {"how-to","product","best practices","api/sdk","sso"}
 
 def normalize_topic_tags(raw: List[str]) -> List[str]:
 	seen = set()
-	normalized = []
+	out: List[str] = []
 	for tag in raw:
 		low = (tag or "").strip().lower()
 		low = low.replace("best-practice","best practices")
@@ -375,8 +416,8 @@ def normalize_topic_tags(raw: List[str]) -> List[str]:
 			low = "api/sdk"
 		if low and low not in seen:
 			seen.add(low)
-			normalized.append(low)
-	return normalized[:3]
+			out.append(low)
+	return out[:3]
 
 
 def run_agent(user_message: str, conversation: List[ConversationMessage], system_instruction: str | None = None) -> Dict[str, Any]:
@@ -434,6 +475,7 @@ def run_agent(user_message: str, conversation: List[ConversationMessage], system
 
 	# Iteratively resolve tool calls (basic implementation)
 	safety_counter = 0
+	final_text: str = ""  # ensure defined for all exit paths
 	while True:
 		safety_counter += 1
 		if safety_counter > 5:  # Prevent infinite loops
@@ -448,6 +490,18 @@ def run_agent(user_message: str, conversation: List[ConversationMessage], system
 			if fc:
 				function_calls.append(fc)
 		if not function_calls:
+			# no more tool calls; attempt to read text then break
+			try:
+				final_text = response.text  # may fail if residual structured parts
+			except Exception:
+				parts_out: List[str] = []
+				cand = response.candidates[0] if getattr(response, "candidates", None) else None
+				if cand:
+					for part in getattr(cand.content, "parts", []) or []:
+						text_val = getattr(part, "text", None)
+						if text_val:
+							parts_out.append(text_val)
+				final_text = "\n".join(parts_out) if parts_out else "(No response generated)"
 			break
 		# Execute each function call
 		for fc in function_calls:
@@ -476,11 +530,11 @@ def run_agent(user_message: str, conversation: List[ConversationMessage], system
 				response = chat.send_message({"role": "tool", "parts": [tool_payload]})
 			except Exception:
 				break
-		# Continue loop to detect any further tool calls
+	# If final_text still empty attempt one last extraction
+	if not final_text:
 		try:
-			final_text = response.text  # may raise if function_call parts remain
+			final_text = response.text  # type: ignore
 		except Exception:
-			# Manual assembly from textual parts only
 			parts_out: List[str] = []
 			cand = response.candidates[0] if getattr(response, "candidates", None) else None
 			if cand:
@@ -502,16 +556,15 @@ def build_system_instruction(ticket: Optional[TicketResponse]) -> str:
 	- Output and logging requirements.
 	"""
 	core = (
-		"You are Atlan's Customer Support AI Copilot. Your goals per user query:\n"
-		"1. Ensure the ticket has an up-to-date classification: topic_tags (1-3 from: How-to, Product, Connector, Lineage, API/SDK, SSO, Glossary, Best practices, Sensitive data), sentiment (Frustrated, Curious, Angry, Neutral, Positive, Negative), priority (P0 (High), P1 (Medium), P2 (Low)).\n"
-		"2. If classification missing or clearly stale, derive it and persist using update_ticket (with classification.* fields).\n"
-		"3. If the (primary) topic is one of: How-to, Product, Best practices, API/SDK, SSO -> call answer_with_rag(question=original user question). Use its sources to craft the final answer and cite them under 'Sources:' as plain URLs.\n"
-		"4. For other topics (Connector, Lineage, Glossary, Sensitive data, etc.) do NOT call answer_with_rag; instead respond with a routing message: \"This ticket has been classified as '<Topic>' and routed to the appropriate team.\"\n"
-		"5. Always append your natural language answer only after tool usage is done.\n"
-		"6. When a specific ticket is in scope you MUST log both the user's latest message and your final answer using add_message_to_ticket (unless already logged by the backend).\n"
-		"7. Use fetch_tickets ONLY if you need broader context across tickets (rare).\n"
-		"8. Never hallucinate sources; only cite URLs returned by answer_with_rag.\n"
-		"9. Keep responses concise, actionable, and professional.\n"
+		"You are Atlan's Customer Support AI Copilot. Workflow per user query:\n"
+		"1. Ensure ticket classification is current (topic_tags 1-3, sentiment, priority). If missing/stale, call update_ticket. Be LIBERAL assigning 'how-to', 'product', 'api/sdk', 'sso', or 'best practices' when the user is asking for steps, configuration, integration, authentication, setup, usage guidance, API details, tokens, SSO/identity, or optimization. Prefer one of these RAG-eligible topics if doubt exists.\n"
+		"2. For informational/how-to/product/API questions: discover documentation URLs via list_doc_urls (use filter terms: e.g. 'snowflake', 'lineage', 'api token'). You may paginate/refine.\n"
+		"3. Select at most 10 highly relevant URLs and call answer_with_urls(question, urls=[...]) to generate a grounded answer.\n"
+		"4. Cite ONLY the URLs you passed to answer_with_urls under a 'Sources:' section (plain list).\n"
+		"5. If the query is clearly a routing topic (e.g., internal connector escalation) and docs won't help, respond with routing message instead of doc tools.\n"
+		"6. Log conversation messages with add_message_to_ticket when a ticket is active (user + your reply).\n"
+		"7. Do not fabricate URLs. Never cite URLs you did not pass to answer_with_urls.\n"
+		"8. Keep answers concise, stepwise for setup questions, and professional.\n"
 	)
 	if ticket:
 		core += (
@@ -564,9 +617,14 @@ def classify_and_update(ticket_doc_id: str, ticket_text: str):
 		return
 	# System-style instruction
 	prompt = f"""
-You are an assistant that classifies customer support tickets.
-Return ONLY valid JSON with keys: topic_tags (array of 1-5 concise lowercase tags), sentiment (one of: Positive, Neutral, Negative), priority (one of: 'P0 (High)','P1 (Medium)','P2 (Low)').
-If unsure, make a best-effort guess. No extra text.
+You classify support tickets. Return STRICT JSON only.
+Keys:
+	topic_tags: array 1-5 lowercase tags. ALWAYS include a RAG tag (how-to, product, best practices, api/sdk, sso) FIRST when user asks for steps, setup, configuration, integration, authentication, API usage, optimization, troubleshooting, tokens, SSO, security setup.
+	sentiment: Positive | Neutral | Negative.
+	priority: 'P0 (High)' | 'P1 (Medium)' | 'P2 (Low)'.
+Vendor how-to example: "How do I connect to Snowflake" => ["how-to","snowflake","connector"].
+Add vendor or 'connector' tag second when specific data store/service is referenced.
+Avoid duplicates; keep <=5.
 TICKET TEXT:\n{ticket_text}\nJSON:
 """
 	classification: Dict[str, Any] = {
@@ -595,9 +653,68 @@ TICKET TEXT:\n{ticket_text}\nJSON:
 		pass
 	# Persist using update_ticket helper for consistency
 	try:
-		update_ticket(ticket_doc_id, {"classification": classification})
+		updated = update_ticket(ticket_doc_id, {"classification": classification})
+	except Exception:
+		updated = {"classification": classification}
+
+	# After classification, trigger dynamic agent-driven RAG if eligible
+	try:
+		cls_tags = normalize_topic_tags((updated.get("classification") or {}).get("topic_tags", []))  # type: ignore
+		ref_check = db.collection(TICKETS_COLLECTION).document(ticket_doc_id)
+		snap_check = ref_check.get()
+		conv_existing = []
+		if snap_check.exists:
+			conv_existing = (snap_check.to_dict() or {}).get("conversation", [])
+		if any(t in RAG_TOPICS for t in cls_tags):
+			# RAG flow
+			_generate_rag_answer(ticket_doc_id)
+		else:
+			# Routing flow: add a single routing agent message if none exists yet
+			if not any(m.get("sender") == "agent" for m in conv_existing):
+				primary = cls_tags[0] if cls_tags else "connector"
+				msg = f"This ticket has been classified as a '{primary}' issue and routed to the appropriate team."
+				add_message_to_ticket(ticket_doc_id, "agent", msg)
 	except Exception:
 		pass
+
+
+def _generate_rag_answer(ticket_doc_id: str):
+	"""Invoke the agent tool loop so the MODEL chooses URLs (no manual static list) and generate answer.
+	Skips if an agent message already exists.
+	"""
+	if not AI_ENABLED:
+		return
+	ref = db.collection(TICKETS_COLLECTION).document(ticket_doc_id)
+	snap = ref.get()
+	if not snap.exists:
+		return
+	data = snap.to_dict() or {}
+	conversation = data.get("conversation", [])
+	if any(m.get("sender") == "agent" for m in conversation):
+		return
+	question_text = data.get("body") or data.get("subject") or ""
+	if not question_text.strip():
+		return
+	# Build synthetic conversation and system instruction
+	ticket_model = firestore_ticket_to_model(snap)
+	sys = build_system_instruction(ticket_model) + "\nAUTO-ANSWER MODE: You MUST call list_doc_urls (one or more times) then answer_with_urls for this ticket question. Do not answer without a tool-grounded citation list."
+	conv_objs = [ConversationMessage(sender="user", message=question_text, timestamp=now_ts())]
+	result = run_agent(question_text, conv_objs, system_instruction=sys)
+	reply = result.get("reply", "")
+	tool_calls = result.get("tool_calls", []) or []
+	# If reply lacks Sources but tool_calls include answer_with_urls, patch in sources
+	if "Sources:" not in reply:
+		for call in tool_calls:
+			if call.get("tool") == "answer_with_urls":
+				res = call.get("result") or {}
+				urls = res.get("response", {}).get("used_urls") if isinstance(res.get("response"), dict) else res.get("used_urls")
+				if not urls:
+					urls = res.get("sources")
+				if urls:
+					reply += "\n\nSources:\n" + "\n".join(urls[:10])
+				break
+	if reply:
+		add_message_to_ticket(ticket_doc_id, "agent", reply)
 
 
 def save_ticket(subject: str, body: str, initial_message: Optional[str]) -> str:
@@ -635,108 +752,101 @@ def save_ticket(subject: str, body: str, initial_message: Optional[str]) -> str:
 
 @app.post("/agent_query", response_model=AgentQueryResponse)
 def agent_query(req: AgentQueryRequest):
-	conversation: List[ConversationMessage] = []
+	# -----------------------------
+	# Automatic gating + RAG logic
+	# -----------------------------
 	ticket_id = req.ticket_id
-	system_instruction = None
+	classification: Dict[str, Any] = {}
+	primary_topic = ""
+	# 1. Load ticket & ensure classification if ticket id provided
 	if ticket_id:
 		snap = db.collection(TICKETS_COLLECTION).document(ticket_id).get()
 		if not snap.exists:
 			raise HTTPException(status_code=404, detail="Ticket not found")
-		ticket_data = firestore_ticket_to_model(snap)
-		conversation = ticket_data.conversation
-		# If classification is still default/empty and AI enabled, attempt on-demand classification
-		try:
-			if AI_ENABLED and (not ticket_data.classification.get("topic_tags")):
-				new_cls = classify_ticket(ticket_data.subject, ticket_data.body)
-				update_ticket(ticket_data.id, {"classification": new_cls})
-				# refresh ticket_data
-				refreshed = db.collection(TICKETS_COLLECTION).document(ticket_id).get()
-				ticket_data = firestore_ticket_to_model(refreshed)
-		except Exception:
-			pass
-		# Build dynamic system instruction with ticket metadata
-		system_instruction = build_system_instruction(ticket_data)
-		# Inject a synthetic context message so model sees full ticket without needing tool call
-		cls = ticket_data.classification or {}
-		context_message = ConversationMessage(
-			sender="user",
-			message=(
-				f"[TICKET CONTEXT]\nID: {ticket_data.id}\nSubject: {ticket_data.subject}\n"
-				f"Body: {ticket_data.body}\nClassification: {cls}"
-			),
-			timestamp=now_ts(),
-		)
-		conversation = [context_message] + conversation
-	elif req.conversation:
-		conversation = req.conversation
+		t = firestore_ticket_to_model(snap)
+		classification = t.classification or {}
+		if AI_ENABLED and not classification.get("topic_tags"):
+			try:
+				classification = classify_ticket(t.subject, t.body)
+				update_ticket(ticket_id, {"classification": classification})
+			except Exception:
+				pass
 	else:
-		conversation = []
+		# Ad-hoc question without ticket: classify the question text itself (subject surrogate).
+		if AI_ENABLED:
+			classification = classify_ticket(req.user_message[:60], req.user_message)
+		else:
+			classification = {"topic_tags": [], "sentiment": "Neutral", "priority": "P2 (Low)"}
 
-	# Append user message to conversation context (not yet stored if ticket)
-	conversation.append(
-		ConversationMessage(sender="user", message=req.user_message, timestamp=now_ts())
-	)
+	# 2. Normalize & pick primary topic
+	raw_tags = classification.get("topic_tags", []) or []
+	normalized_tags = normalize_topic_tags(raw_tags)
+	# Apply prioritization heuristic to bias toward RAG-eligible topics
+	# No heuristic reordering now; rely solely on model liberal tagging per prompt.
+	primary_topic = normalized_tags[0] if normalized_tags else ""
 
-	# If no ticket, still provide a generic system instruction
-	if not system_instruction:
-		system_instruction = build_system_instruction(None)
+	# 3. Decide routing vs RAG purely from model-provided tags
+	use_rag = any(t in RAG_TOPICS for t in normalized_tags)
+	tool_calls: List[Dict[str, Any]] = []
+	used_urls: List[str] = []
+	reply = ""
+	routed = False
 
-	result = run_agent(req.user_message, conversation, system_instruction=system_instruction)
-	reply = result.get("reply", "")
-	tool_calls = result.get("tool_calls", [])
+	if use_rag and AI_ENABLED:
+		# Lightweight automatic doc selection using list_doc_urls heuristics over user query keywords.
+		from tools import list_doc_urls as _list, answer_with_urls as _anw
+		# Extract up to 5 meaningful keywords >3 chars (very naive)
+		import re
+		words = [w.lower() for w in re.findall(r"[A-Za-z0-9_-]+", req.user_message) if len(w) > 3]
+		seen_kw = []
+		for w in words:
+			if w in seen_kw:
+				continue
+			seen_kw.append(w)
+			res = _list(filter=w, limit=30, offset=0)
+			tool_calls.append({"tool": "list_doc_urls", "args": {"filter": w, "limit": 30}, "result": {"returned": res.get("returned"), "sample": res.get("urls", [])[:5]}})
+			for u in res.get("urls", []):
+				if u not in used_urls:
+					used_urls.append(u)
+					if len(used_urls) >= 10:
+						break
+			if len(used_urls) < 5:
+				# Fallback broad search if not enough
+				fallback = _list(filter="atlan", limit=20, offset=0)
+				tool_calls.append({"tool": "list_doc_urls", "args": {"filter": "atlan", "limit": 20}, "result": {"returned": fallback.get("returned")}})
+				for u in fallback.get("urls", []):
+					if u not in used_urls:
+						used_urls.append(u)
+						if len(used_urls) >= 10:
+							break
+		answer_payload = _anw(question=req.user_message, urls=used_urls)
+		tool_calls.append({"tool": "answer_with_urls", "args": {"question": req.user_message, "urls": used_urls}, "result": {"meta": answer_payload.get("meta", {}), "error": answer_payload.get("error")}})
+		ans_text = answer_payload.get("answer", "")
+		sources = answer_payload.get("sources", used_urls)
+		if sources and "Sources:" not in ans_text:
+			ans_text += "\n\nSources:\n" + "\n".join(sources)
+		reply = ans_text or "(No answer generated)"
+	else:
+		routed = True
+		pretty_topic = primary_topic.title() if primary_topic else "general"
+		reply = f"This ticket has been classified as a '{pretty_topic}' issue and routed to the appropriate team."
 
-	# Fallback path if agent loop failed or produced empty reply
-	if not reply or reply.startswith("Agent error") or reply.startswith("Agent unexpected error"):
-		try:
-			# Attempt direct classification + optional RAG
-			if ticket_id:
-				# Refresh latest ticket state
-				fresh = db.collection(TICKETS_COLLECTION).document(ticket_id).get()
-				if fresh.exists:
-					fresh_ticket = firestore_ticket_to_model(fresh)
-					classification = fresh_ticket.classification or {}
-					if not classification.get("topic_tags"):
-						classification = classify_ticket(fresh_ticket.subject, fresh_ticket.body)
-						update_ticket(ticket_id, {"classification": classification})
-					tags = normalize_topic_tags(classification.get("topic_tags", []))
-					rag_topics = {"how-to","product","best","api/sdk","sso","api","sdk","best practices"}
-					use_rag = any(tag in RAG_TOPICS for tag in tags)
-					if use_rag:
-						from tools import answer_with_rag as _rag
-						rag_res = _rag(req.user_message)
-						sources = rag_res.get("sources", [])
-						reply = f"{rag_res.get('answer','(no answer)')}\n\nSources:\n" + "\n".join(sources)
-					else:
-						primary = tags[0] if tags else "connector"
-						reply = f"This ticket has been classified as '{primary}' and routed to the appropriate team."
-			else:
-				# No ticket context: answer generically via RAG as best effort
-				from tools import answer_with_rag as _rag2
-				rag_res2 = _rag2(req.user_message)
-				reply = rag_res2.get("answer","(no answer)") + "\n\nSources:\n" + "\n".join(rag_res2.get("sources", []))
-		except Exception as _fb_err:  # pragma: no cover
-			reply = reply or f"(Fallback agent failure: {_fb_err})"
-
-	# Persist user + agent messages if tied to ticket
+	# 4. Persist conversation if we have a ticket id
 	if ticket_id:
 		try:
-			# Avoid duplicate user logging if already present as last entry
-			current = db.collection(TICKETS_COLLECTION).document(ticket_id).get()
-			if current.exists:
-				cur_data = current.to_dict() or {}
-				conv = cur_data.get("conversation", [])
-				if not conv or conv[-1].get("message") != req.user_message:
-					add_message_to_ticket(ticket_id, "user", req.user_message)
-			# Always log agent reply if different from last
-			current2 = db.collection(TICKETS_COLLECTION).document(ticket_id).get()
-			if current2.exists:
-				conv2 = (current2.to_dict() or {}).get("conversation", [])
-				if not conv2 or conv2[-1].get("message") != reply:
-					add_message_to_ticket(ticket_id, "agent", reply)
+			add_message_to_ticket(ticket_id, "user", req.user_message)
+			add_message_to_ticket(ticket_id, "agent", reply)
 		except Exception:
-			pass  # Don't fail request on DB persistence error
+			pass
 
-	return AgentQueryResponse(reply=reply, tool_calls=tool_calls, ticket_id=ticket_id)
+	return AgentQueryResponse(
+		reply=reply,
+		tool_calls=tool_calls,
+		ticket_id=ticket_id,
+		classification=classification,
+		used_urls=used_urls,
+		routed=routed,
+	)
 
 
 # --------------------------- Tool Endpoints (Optional) ---------------------

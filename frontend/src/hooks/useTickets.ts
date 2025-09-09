@@ -1,5 +1,5 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import { fetchTickets, createTicket, mapBackendTicket, BackendTicket, getTicket } from '@/lib/api';
+import { fetchTickets, createTicket, mapBackendTicket, BackendTicket, getTicket, deleteTicket, updateTicketFields } from '@/lib/api';
 
 export function useTickets() {
   const qc = useQueryClient();
@@ -33,10 +33,26 @@ export function useTickets() {
     });
   };
 
+  const deleteMutation = useMutation({
+    mutationFn: async (id: string) => deleteTicket(id),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['tickets'] });
+    }
+  });
+
+  const updateMutation = useMutation({
+    mutationFn: async (vars: { id: string; updates: Record<string, any> }) => updateTicketFields(vars.id, vars.updates),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['tickets'] });
+    }
+  });
+
   return {
     ticketsQuery,
     createTicket: (subject: string, body: string) => createMutation.mutate({ subject, body }),
     creating: createMutation.isPending,
     refetchTicket,
+  deleteTicket: (id: string) => deleteMutation.mutate(id),
+  updateTicket: (id: string, updates: Record<string, any>) => updateMutation.mutate({ id, updates }),
   };
 }
