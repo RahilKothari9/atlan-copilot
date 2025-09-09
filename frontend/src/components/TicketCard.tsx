@@ -13,6 +13,7 @@ export interface Ticket {
   timestamp: string;
   timeAgo: string;
   isClassifying?: boolean;
+  conversation?: { sender: string; message: string; timestamp: number }[];
 }
 
 interface TicketCardProps {

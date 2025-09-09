@@ -1,24 +1,26 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { TicketCard, Ticket } from "@/components/TicketCard";
 import { TicketFilters, FilterState } from "@/components/TicketFilters";
-import { ChatInterface, ChatMessage } from "@/components/ChatInterface";
+import { ChatInterface } from "@/components/ChatInterface";
 import { TicketDetailView } from "@/components/TicketDetailView";
 import { NewTicketModal } from "@/components/NewTicketModal";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Sparkles } from "lucide-react";
-import { mockTickets } from "@/data/mockTickets";
 import { useToast } from "@/hooks/use-toast";
+import { useTickets } from "@/hooks/useTickets";
+import { useAgentChat } from "@/hooks/useAgentChat";
+import { useTicketDetail } from "@/hooks/useTicketDetail";
 
 type ViewState = 
   | { type: "chat" }
   | { type: "ticket-detail"; ticket: Ticket };
 
 export default function Index() {
-  const [tickets, setTickets] = useState<Ticket[]>(mockTickets);
+  const { ticketsQuery, createTicket, creating } = useTickets();
   const [selectedTicket, setSelectedTicket] = useState<Ticket | null>(null);
+  const ticketDetail = useTicketDetail(selectedTicket?.id);
   const [viewState, setViewState] = useState<ViewState>({ type: "chat" });
-  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
-  const [isLoading, setIsLoading] = useState(false);
+  const { messages, send, loading, setMessages } = useAgentChat(selectedTicket?.id);
   const [filters, setFilters] = useState<FilterState>({
     search: "",
     priority: "All",
@@ -29,6 +31,7 @@ export default function Index() {
   const { toast } = useToast();
 
   // Filter tickets based on current filters
+  const tickets = ticketsQuery.data || [];
   const filteredTickets = tickets.filter((ticket) => {
     const matchesSearch = filters.search === "" || 
       ticket.title.toLowerCase().includes(filters.search.toLowerCase()) ||
@@ -45,6 +48,7 @@ export default function Index() {
   const handleTicketSelect = (ticket: Ticket) => {
     setSelectedTicket(ticket);
     setViewState({ type: "ticket-detail", ticket });
+    setMessages([]); // reset chat context when switching tickets
   };
 
   const handleBackToChat = () => {
@@ -53,42 +57,7 @@ export default function Index() {
   };
 
   const handleSendMessage = async (message: string) => {
-    const userMessage: ChatMessage = {
-      id: Date.now().toString(),
-      type: "user",
-      content: message,
-      timestamp: new Date()
-    };
-
-    setChatMessages(prev => [...prev, userMessage]);
-    setIsLoading(true);
-
-    // Simulate AI response
-    setTimeout(() => {
-      let aiResponse = "";
-      let sources: { title: string; url: string }[] = [];
-
-      if (message.toLowerCase().includes("ticket") || message.toLowerCase().includes("search")) {
-        aiResponse = `I found ${filteredTickets.length} tickets matching your query. Here are the most relevant ones:\n\n${filteredTickets.slice(0, 3).map(t => `• ${t.id}: ${t.title}`).join('\n')}`;
-        sources = [
-          { title: "Ticket Search Documentation", url: "#" },
-          { title: "Support Knowledge Base", url: "#" }
-        ];
-      } else {
-        aiResponse = "I'm here to help you with ticket management, searches, and support queries. You can ask me to find tickets, classify issues, or get information about customer problems.";
-      }
-
-      const assistantMessage: ChatMessage = {
-        id: (Date.now() + 1).toString(),
-        type: "assistant", 
-        content: aiResponse,
-        timestamp: new Date(),
-        sources: sources.length > 0 ? sources : undefined
-      };
-
-      setChatMessages(prev => [...prev, assistantMessage]);
-      setIsLoading(false);
-    }, 1500);
+    send(message);
   };
 
   const handleUpdateTicket = (ticketId: string) => {
@@ -113,35 +82,8 @@ export default function Index() {
   };
 
   const handleCreateTicket = (subject: string, body: string) => {
-    const newTicketId = `ATL-${Math.floor(Math.random() * 100000)}`;
-    const newTicket: Ticket = {
-      id: newTicketId,
-      title: subject,
-      content: body,
-      priority: "P2",
-      sentiment: "Curious",
-      topics: ["How-to"],
-      timestamp: new Date().toISOString(),
-      timeAgo: "Just now",
-      isClassifying: true
-    };
-
-    // Add ticket to the top of the list
-    setTickets(prev => [newTicket, ...prev]);
-
-    // After 2 seconds, remove the loading state
-    setTimeout(() => {
-      setTickets(prev => prev.map(ticket => 
-        ticket.id === newTicketId 
-          ? { ...ticket, isClassifying: false }
-          : ticket
-      ));
-    }, 2000);
-
-    toast({
-      title: "Ticket Created",
-      description: `Ticket ${newTicketId} has been created successfully.`
-    });
+    createTicket(subject, body);
+    toast({ title: "Ticket Created", description: `Ticket created. Classification pending...` });
   };
 
   return (
@@ -193,13 +135,13 @@ export default function Index() {
         <div className="w-[35%] bg-card">
           {viewState.type === "chat" ? (
             <ChatInterface
-              messages={chatMessages}
+              messages={messages}
               onSendMessage={handleSendMessage}
-              isLoading={isLoading}
+              isLoading={loading}
             />
           ) : (
             <TicketDetailView
-              ticket={viewState.ticket}
+              ticket={{ ...viewState.ticket, conversation: ticketDetail.data?.conversation || viewState.ticket.conversation }}
               onBack={handleBackToChat}
               onUpdate={handleUpdateTicket}
               onDelete={handleDeleteTicket}

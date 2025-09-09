@@ -100,11 +100,31 @@ export function TicketDetailView({
 
       {/* Ticket content */}
       <ScrollArea className="flex-1 p-4">
-        <div className="space-y-4">
+        <div className="space-y-6">
           <div>
-            <h3 className="text-sm font-medium text-foreground mb-2">Customer Message</h3>
-            <div className="bg-muted/30 rounded-md p-4 text-sm text-foreground leading-relaxed">
+            <h3 className="text-sm font-medium text-foreground mb-2">Original Ticket</h3>
+            <div className="bg-muted/30 rounded-md p-4 text-sm text-foreground leading-relaxed whitespace-pre-wrap">
               {ticket.content}
+            </div>
+          </div>
+          <div>
+            <h3 className="text-sm font-medium text-foreground mb-2">Conversation</h3>
+            {(!ticket.conversation || ticket.conversation.length === 0) && (
+              <p className="text-xs text-muted-foreground">No messages yet.</p>
+            )}
+            <div className="space-y-3">
+              {ticket.conversation?.map((m, idx) => {
+                const isUser = m.sender === 'user';
+                return (
+                  <div key={idx} className="flex flex-col gap-1">
+                    <div className="text-[10px] uppercase tracking-wide text-muted-foreground">{isUser ? 'User' : 'Agent'} • {new Date(m.timestamp * 1000).toLocaleTimeString()}</div>
+                    <div className={cn(
+                      'rounded-md px-3 py-2 text-xs border border-border/50 whitespace-pre-wrap',
+                      isUser ? 'bg-chat-user text-white border-transparent' : 'bg-chat-assistant text-foreground'
+                    )}>{m.message}</div>
+                  </div>
+                );
+              })}
             </div>
           </div>
         </div>

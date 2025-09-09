@@ -166,17 +166,43 @@ def firestore_ticket_to_model(doc: firestore.DocumentSnapshot) -> TicketResponse
 
 # ----------------------------------------------------------------------------
 from tools import answer_with_rag  # Feature 4 RAG implementation
+try:  # Firestore FieldFilter (new style). Fallback to None if unavailable.
+	from google.cloud.firestore_v1 import FieldFilter  # type: ignore
+except Exception:  # pragma: no cover
+	FieldFilter = None  # type: ignore
 
 
 def fetch_tickets(filters: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+	"""Fetch tickets with optional filters using explicit FieldFilter objects.
+
+	This removes the positional argument warning emitted by the Firestore SDK.
+	Supported filters: status, priority, sentiment.
+	"""
 	query = db.collection(TICKETS_COLLECTION)
 	if filters:
-		if status := filters.get("status"):
-			query = query.where("status", "==", status)
-		if priority := filters.get("priority"):
-			query = query.where("classification.priority", "==", priority)
-		if sentiment := filters.get("sentiment"):
-			query = query.where("classification.sentiment", "==", sentiment)
+		status = filters.get("status")
+		priority = filters.get("priority")
+		sentiment = filters.get("sentiment")
+		# Use new FieldFilter if available; otherwise fall back to legacy positional form.
+		if FieldFilter:
+			if status:
+				query = query.where(filter=FieldFilter("status", "==", status))
+			if priority:
+				query = query.where(filter=FieldFilter("classification.priority", "==", priority))
+			if sentiment:
+				query = query.where(filter=FieldFilter("classification.sentiment", "==", sentiment))
+		else:  # Fallback (may emit warning)
+			if status:
+				query = query.where("status", "==", status)
+			if priority:
+				query = query.where("classification.priority", "==", priority)
+			if sentiment:
+				query = query.where("classification.sentiment", "==", sentiment)
+	try:
+		# Order newest first
+		query = query.order_by("createdAt", direction=firestore.Query.DESCENDING)  # type: ignore
+	except Exception:
+		pass  # Fallback silently if ordering not supported
 	docs = query.limit(50).stream()
 	return [firestore_ticket_to_model(d).dict() for d in docs]
 

@@ -93,16 +93,17 @@ def _ensure_sitemaps(refresh: bool = False) -> None:
 
 
 KEYWORD_BOOSTS = {
-    'snowflake': 5,
-    'connection': 2,
-    'ingest': 3,
-    'ingestion': 3,
-    'api': 3,
-    'sdk': 3,
-    'token': 3,
-    'auth': 2,
-    'lineage': 2,
-    'glossary': 1,
+    'snowflake': 8,
+    'connecting-to-snowflake': 10,
+    'connection': 3,
+    'ingest': 4,
+    'ingestion': 4,
+    'api': 4,
+    'sdk': 4,
+    'token': 4,
+    'auth': 3,
+    'lineage': 3,
+    'glossary': 2,
 }
 
 
@@ -147,6 +148,9 @@ def _select_candidate_urls(question: str, max_total: int = 20) -> Tuple[List[str
         'glossary': [
             'https://docs.atlan.com/docs/glossary-overview'
         ],
+        'bigquery': [
+            'https://docs.atlan.com/docs/connecting-to-bigquery'
+        ],
     }
     qlow = question.lower()
     for k, pages in curated_map.items():
@@ -175,12 +179,13 @@ def _build_prompt(question: str, candidate_urls: List[str]) -> str:
     url_list = "\n".join(candidate_urls)
     return (
         "You are Atlan's helpdesk AI specialized in factual, source-grounded answers.\n"
-        "Strict rules:\n"
-        "1. Use ONLY the provided URLs.\n"
-        "2. Prefer product documentation (docs.atlan.com) for how-to and connection steps unless the question is explicitly about API/SDK auth or endpoints.\n"
-        "3. Provide numbered steps for connection / setup questions (e.g., Snowflake).\n"
-        "4. Do NOT hallucinate. If critically missing, say: I'm not fully sure based on the current documentation.\n"
-        "5. Always end with a blank line then Sources: each cited URL on its own line (only those you actually used).\n"
+        "Follow these rules strictly:\n"
+        "1. Use ONLY content that plausibly exists in the provided URLs (no external knowledge).\n"
+        "2. Prefer docs.atlan.com pages for step-by-step product setup (Snowflake, BigQuery, ingestion).\n"
+        "3. For connection or ingestion questions, produce clear, concise numbered steps (1., 2., 3., ...).\n"
+        "4. If at least one highly relevant page (like connecting-to-snowflake) is present, you MUST answer using it—do not say you're unsure.\n"
+        "5. Only if none of the URLs obviously cover the topic may you say you're not fully sure.\n"
+        "6. End with a blank line then 'Sources:' and only the URLs you actually relied on, one per line.\n"
         f"Original Question: {question}\n\nCandidate Documentation URLs (ranked):\n{url_list}\n"
     )
 
@@ -226,8 +231,9 @@ def answer_with_rag(question: str) -> Dict[str, Any]:
     except Exception as e:  # pragma: no cover
         answer_text = f"RAG error: {e}"[:400]
     # Second-pass retry if unsure but we have a strong curated page
-    unsure_phrase = "not fully sure" in answer_text.lower()
-    key_pages = [u for u in candidate_urls if 'connecting-to-snowflake' in u]
+    lower_ans = answer_text.lower()
+    unsure_phrase = "not fully sure" in lower_ans or "i am unsure" in lower_ans
+    key_pages = [u for u in candidate_urls if any(k in u for k in ["connecting-to-snowflake","connecting-to-bigquery"]) ]
     if unsure_phrase and key_pages:
         try:
             retry_subset = key_pages[:1]
@@ -245,7 +251,14 @@ def answer_with_rag(question: str) -> Dict[str, Any]:
                 raw_meta['retry_used'] = True
         except Exception:
             pass
-    return {"answer": answer_text, "sources": grounding_subset if 'grounding_subset' in locals() else candidate_urls[:10], "raw": raw_meta}
+    # Derive sources from answer by checking which candidate URLs appear; fallback to grounding subset
+    cited: List[str] = []
+    for u in candidate_urls:
+        if u in answer_text:
+            cited.append(u)
+    if not cited:
+        cited = list(candidate_urls[:5])
+    return {"answer": answer_text, "sources": cited, "raw": raw_meta}
 
 
 __all__ = ["answer_with_rag", "_ensure_sitemaps"]
