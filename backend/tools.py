@@ -12,6 +12,7 @@ import os
 import time
 import xml.etree.ElementTree as ET
 from typing import Dict, Any, List, Tuple
+import re
 
 from dotenv import load_dotenv
 
@@ -91,12 +92,32 @@ def _ensure_sitemaps(refresh: bool = False) -> None:
         })
 
 
+KEYWORD_BOOSTS = {
+    'snowflake': 5,
+    'connection': 2,
+    'ingest': 3,
+    'ingestion': 3,
+    'api': 3,
+    'sdk': 3,
+    'token': 3,
+    'auth': 2,
+    'lineage': 2,
+    'glossary': 1,
+}
+
+
 def _score_url(url: str, tokens: List[str]) -> int:
-    score = 0
     lower = url.lower()
+    score = 0
     for t in tokens:
         if t and t in lower:
             score += 1
+    for k, b in KEYWORD_BOOSTS.items():
+        if k in lower:
+            score += b
+    # slight preference for docs over developer unless dev-specific
+    if 'developer.atlan.com' in lower:
+        score -= 1
     return score
 
 
@@ -113,12 +134,33 @@ def _select_candidate_urls(question: str, max_total: int = 20) -> Tuple[List[str
     # Score
     prod_scored = sorted(product_urls, key=lambda u: _score_url(u, tokens), reverse=True)[: max_total]
     dev_scored = sorted(developer_urls, key=lambda u: _score_url(u, tokens), reverse=True)[: max_total]
+    # Curated key product pages (added if relevant)
+    curated_hits: List[str] = []
+    curated_map = {
+        'snowflake': [
+            'https://docs.atlan.com/docs/connecting-to-snowflake',
+            'https://docs.atlan.com/docs/ingesting-from-snowflake',
+        ],
+        'lineage': [
+            'https://docs.atlan.com/docs/lineage'
+        ],
+        'glossary': [
+            'https://docs.atlan.com/docs/glossary-overview'
+        ],
+    }
+    qlow = question.lower()
+    for k, pages in curated_map.items():
+        if k in qlow:
+            for p in pages:
+                curated_hits.append(p)
     if is_dev_question:
-        primary = dev_scored[: max_total - 5]
-        secondary = prod_scored[:5]
+        primary = dev_scored[: max_total - 6]
+        secondary = prod_scored[:6]
     else:
-        primary = prod_scored[: max_total - 5]
-        secondary = dev_scored[:5]
+        primary = prod_scored[: max_total - 4]
+        secondary = dev_scored[:4]
+    # Prepend curated hits (dedup later)
+    primary = curated_hits + primary
     # Deduplicate while preserving order
     seen = set()
     ordered: List[str] = []
@@ -132,10 +174,14 @@ def _select_candidate_urls(question: str, max_total: int = 20) -> Tuple[List[str
 def _build_prompt(question: str, candidate_urls: List[str]) -> str:
     url_list = "\n".join(candidate_urls)
     return (
-        "You are Atlan's helpdesk AI. Use ONLY the provided candidate URLs as authoritative sources.\n"
-        "If information is missing, reply that you are unsure.\n"
-        "List cited sources at the end under 'Sources:'.\n"
-        f"Question: {question}\n\nCandidate URLs (model may choose subset):\n{url_list}\n"
+        "You are Atlan's helpdesk AI specialized in factual, source-grounded answers.\n"
+        "Strict rules:\n"
+        "1. Use ONLY the provided URLs.\n"
+        "2. Prefer product documentation (docs.atlan.com) for how-to and connection steps unless the question is explicitly about API/SDK auth or endpoints.\n"
+        "3. Provide numbered steps for connection / setup questions (e.g., Snowflake).\n"
+        "4. Do NOT hallucinate. If critically missing, say: I'm not fully sure based on the current documentation.\n"
+        "5. Always end with a blank line then Sources: each cited URL on its own line (only those you actually used).\n"
+        f"Original Question: {question}\n\nCandidate Documentation URLs (ranked):\n{url_list}\n"
     )
 
 
@@ -150,13 +196,22 @@ def answer_with_rag(question: str) -> Dict[str, Any]:
             "sources": DOC_FALLBACK,
         }
     candidate_urls, primary_ranked = _select_candidate_urls(question)
+    # For product-style question (no dev signals) heavily favor product docs in grounding subset
+    dev_keywords = {"api","sdk","endpoint","graphql","token","rest"}
+    tokens = set(t for t in re.split(r"\W+", question.lower()) if t)
+    is_dev = any(t in dev_keywords for t in tokens)
+    if not is_dev:
+        # Filter out most developer urls keeping at most 2
+        prod_only = [u for u in candidate_urls if 'docs.atlan.com' in u]
+        dev_tail = [u for u in candidate_urls if 'developer.atlan.com' in u][:2]
+        if prod_only:
+            candidate_urls = prod_only + dev_tail
     prompt = _build_prompt(question, candidate_urls)
     answer_text = "(No answer)"
     raw_meta: Dict[str, Any] = {}
     try:
         model = genai.GenerativeModel(MODEL_NAME)
-        # Use only top 12 to avoid excessive grounding payload
-        grounding_subset = candidate_urls[:12]
+        grounding_subset = candidate_urls[:10]
         if grounding and hasattr(grounding, "UrlContext"):
             url_ctx = grounding.UrlContext(urls=grounding_subset)  # type: ignore
             response = model.generate_content([prompt, url_ctx])
@@ -170,7 +225,27 @@ def answer_with_rag(question: str) -> Dict[str, Any]:
         }
     except Exception as e:  # pragma: no cover
         answer_text = f"RAG error: {e}"[:400]
-    return {"answer": answer_text, "sources": candidate_urls, "raw": raw_meta}
+    # Second-pass retry if unsure but we have a strong curated page
+    unsure_phrase = "not fully sure" in answer_text.lower()
+    key_pages = [u for u in candidate_urls if 'connecting-to-snowflake' in u]
+    if unsure_phrase and key_pages:
+        try:
+            retry_subset = key_pages[:1]
+            if grounding and hasattr(grounding, 'UrlContext'):
+                url_ctx = grounding.UrlContext(urls=retry_subset)  # type: ignore
+                retry = genai.GenerativeModel(MODEL_NAME).generate_content([
+                    _build_prompt(question, retry_subset), url_ctx
+                ])
+            else:
+                aug = _build_prompt(question, retry_subset) + "\n" + "\n".join(retry_subset)
+                retry = genai.GenerativeModel(MODEL_NAME).generate_content(aug)
+            new_text = (getattr(retry, 'text', '') or '').strip()
+            if new_text and 'not fully sure' not in new_text.lower():
+                answer_text = new_text
+                raw_meta['retry_used'] = True
+        except Exception:
+            pass
+    return {"answer": answer_text, "sources": grounding_subset if 'grounding_subset' in locals() else candidate_urls[:10], "raw": raw_meta}
 
 
 __all__ = ["answer_with_rag", "_ensure_sitemaps"]
