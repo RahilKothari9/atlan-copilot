@@ -165,22 +165,7 @@ def firestore_ticket_to_model(doc: firestore.DocumentSnapshot) -> TicketResponse
 
 
 # ----------------------------------------------------------------------------
-# Tool Functions (Agent Accessible)
-# ----------------------------------------------------------------------------
-
-def answer_with_rag(question: str) -> Dict[str, Any]:
-	"""Answer a question using RAG over Atlan docs (placeholder).
-
-	Implement later:
-	  1. Embed docs -> vector store
-	  2. Retrieve top-k
-	  3. Provide context to Gemini for grounded generation
-	"""
-	return {
-		"answer": "RAG not yet implemented. This is a placeholder answer.",
-		"sources": [],
-		"question": question,
-	}
+from tools import answer_with_rag  # Feature 4 RAG implementation
 
 
 def fetch_tickets(filters: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
