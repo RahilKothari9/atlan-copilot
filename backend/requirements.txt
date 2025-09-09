@@ -1,0 +1,7 @@
+fastapi
+uvicorn[standard]
+firebase-admin
+python-dotenv
+google-generativeai
+pydantic
+watchfiles
