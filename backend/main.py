@@ -172,7 +172,8 @@ def firestore_ticket_to_model(doc: firestore.DocumentSnapshot) -> TicketResponse
 
 
 # ----------------------------------------------------------------------------
-from tools import list_doc_urls, answer_with_urls  # New dynamic doc tools
+# Legacy tool-based RAG removed; new RAG pipeline handled separately at ticket creation
+from rag import answer_question, build_index, index_status  # embedding-based RAG
 try:  # Firestore FieldFilter (new style). Fallback to None if unavailable.
 	from google.cloud.firestore_v1 import FieldFilter  # type: ignore
 except Exception:  # pragma: no cover
@@ -246,8 +247,7 @@ def add_message_to_ticket(ticket_id: str, sender: str, message: str) -> Dict[str
 
 
 TOOL_REGISTRY = {
-	"list_doc_urls": list_doc_urls,
-	"answer_with_urls": answer_with_urls,
+	# Only ticket management tools remain for conversational agent
 	"fetch_tickets": fetch_tickets,
 	"update_ticket": update_ticket,
 	"delete_ticket": delete_ticket,
@@ -259,36 +259,6 @@ def _build_tool_declarations():
 	if not FunctionDeclaration or not Tool:
 		return None
 	fds = [
-		FunctionDeclaration(
-			name="list_doc_urls",
-			description=(
-				"List slices of Atlan documentation URLs (product + developer). Use filter substring to narrow. "
-				"Call this BEFORE answer_with_urls to discover relevant URLs. Supports simple pagination via offset+limit."
-			),
-			parameters={
-				"type": "object",
-				"properties": {
-					"filter": {"type": "string", "description": "Optional substring filter (case-insensitive)"},
-					"limit": {"type": "integer", "description": "Max URLs to return (<=100)"},
-					"offset": {"type": "integer", "description": "Pagination offset"},
-				},
-			},
-		),
-		FunctionDeclaration(
-			name="answer_with_urls",
-			description=(
-				"Generate grounded answer using ONLY the provided URLs (docs.atlan.com / developer.atlan.com). "
-				"You MUST first narrow candidates with list_doc_urls, then pass at most 10 high-signal URLs here."
-			),
-			parameters={
-				"type": "object",
-				"properties": {
-					"question": {"type": "string"},
-					"urls": {"type": "array", "items": {"type": "string"}, "description": "Up to 10 selected URLs"},
-				},
-				"required": ["question", "urls"],
-			},
-		),
 		FunctionDeclaration(
 			name="fetch_tickets",
 			description="Fetch up to 50 tickets optionally filtered by status, priority, sentiment.",
@@ -560,15 +530,12 @@ def build_system_instruction(ticket: Optional[TicketResponse]) -> str:
 	- Output and logging requirements.
 	"""
 	core = (
-		"You are Atlan's Customer Support AI Copilot. Workflow per user query:\n"
-		"1. Ensure ticket classification is current (topic_tags 1-3, sentiment, priority). If missing/stale, call update_ticket. Be LIBERAL assigning 'how-to', 'product', 'api/sdk', 'sso', or 'best practices' when the user is asking for steps, configuration, integration, authentication, setup, usage guidance, API details, tokens, SSO/identity, or optimization. Prefer one of these RAG-eligible topics if doubt exists.\n"
-		"2. For informational/how-to/product/API questions: discover documentation URLs via list_doc_urls (use filter terms: e.g. 'snowflake', 'lineage', 'api token'). You may paginate/refine.\n"
-		"3. Select at most 10 highly relevant URLs and call answer_with_urls(question, urls=[...]) to generate a grounded answer.\n"
-		"4. Cite ONLY the URLs you passed to answer_with_urls under a 'Sources:' section (plain list).\n"
-		"5. If the query is clearly a routing topic (e.g., internal connector escalation) and docs won't help, respond with routing message instead of doc tools.\n"
-		"6. Log conversation messages with add_message_to_ticket when a ticket is active (user + your reply).\n"
-		"7. Do not fabricate URLs. Never cite URLs you did not pass to answer_with_urls.\n"
-		"8. Keep answers concise, stepwise for setup questions, and professional.\n"
+		"You are Atlan's Customer Support Conversational Copilot. RAG answers are generated only at ticket creation by a separate pipeline.\n"
+		"Your responsibilities:\n"
+		"1. Provide helpful, concise conversational guidance based on existing ticket context (do NOT fetch docs).\n"
+		"2. Update classification only if clearly incorrect using update_ticket.\n"
+		"3. Never fabricate documentation citations; do not output a Sources section.\n"
+		"4. Encourage user to add details if information is insufficient.\n"
 	)
 	if ticket:
 		core += (
@@ -596,7 +563,16 @@ app.add_middleware(
 
 @app.get("/health")
 def health():
-	return {"status": "ok", "model": MODEL_NAME, "ai_enabled": AI_ENABLED}
+	return {"status": "ok", "model": MODEL_NAME, "ai_enabled": AI_ENABLED, "rag_index": index_status()}
+
+@app.get("/rag/status")
+def rag_status():
+	return index_status()
+
+@app.post("/rag/rebuild")
+def rag_rebuild():
+	build_index(force=True)
+	return {"rebuilding": True, "rag_index": index_status()}
 
 
 # --------------------------- Ticket Creation -------------------------------
@@ -674,7 +650,7 @@ TICKET TEXT:\n{ticket_text}\nJSON:
 	except Exception:
 		updated = {"classification": classification}
 
-	# After classification, trigger dynamic agent-driven RAG if eligible
+	# After classification, trigger detached RAG (single-shot) only at ticket creation
 	try:
 		cls_tags = normalize_topic_tags((updated.get("classification") or {}).get("topic_tags", []))  # type: ignore
 		ref_check = db.collection(TICKETS_COLLECTION).document(ticket_doc_id)
@@ -682,12 +658,19 @@ TICKET TEXT:\n{ticket_text}\nJSON:
 		conv_existing = []
 		if snap_check.exists:
 			conv_existing = (snap_check.to_dict() or {}).get("conversation", [])
-		if any(t in RAG_TOPICS for t in cls_tags):
-			# RAG flow
-			_generate_rag_answer(ticket_doc_id)
-		else:
-			# Routing flow: add a single routing agent message if none exists yet
-			if not any(m.get("sender") == "agent" for m in conv_existing):
+		if not any(m.get("sender") == "agent" for m in conv_existing):
+			if any(t in RAG_TOPICS for t in cls_tags):
+				# Run new RAG pipeline
+				body = (snap_check.to_dict() or {}).get("body", "")
+				subject = (snap_check.to_dict() or {}).get("subject", "")
+				question_text = body or subject
+				rag_result = answer_question(question_text)
+				ans = rag_result.get("answer", "")
+				if not ans:
+					primary = cls_tags[0] if cls_tags else "connector"
+					ans = f"RAG attempt failed (no grounded answer generated). This ticket has been classified as a '{primary}' issue and routed to the appropriate team."
+				add_message_to_ticket(ticket_doc_id, "agent", ans)
+			else:
 				primary = cls_tags[0] if cls_tags else "connector"
 				msg = f"This ticket has been classified as a '{primary}' issue and routed to the appropriate team."
 				add_message_to_ticket(ticket_doc_id, "agent", msg)
@@ -696,98 +679,8 @@ TICKET TEXT:\n{ticket_text}\nJSON:
 
 
 def _generate_rag_answer(ticket_doc_id: str):
-	"""Attempt tool-grounded answer with retries & deterministic fallback; route with reason on failure."""
-	if not AI_ENABLED:
-		return
-	ref = db.collection(TICKETS_COLLECTION).document(ticket_doc_id)
-	snap = ref.get()
-	if not snap.exists:
-		return
-	data = snap.to_dict() or {}
-	conversation = data.get("conversation", [])
-	# If an agent message already exists we skip to avoid duplicates
-	if any(m.get("sender") == "agent" for m in conversation):
-		return
-	question_text = data.get("body") or data.get("subject") or ""
-	if not question_text.strip():
-		return
-
-	def _programmatic_fallback(q: str) -> str:
-		"""Naive deterministic retrieval using list_doc_urls keywords then answer_with_urls."""
-		try:
-			from tools import list_doc_urls as _list_doc_urls, answer_with_urls as _answer_with_urls
-			import re as _re
-			words = [w.lower() for w in _re.findall(r"[A-Za-z0-9_-]+", q) if len(w) > 3][:12]
-			collected: list[str] = []
-			seen = set()
-			for w in words:
-				if w in seen:
-					continue
-				seen.add(w)
-				res = _list_doc_urls(filter=w, limit=40, offset=0)
-				for u in res.get("urls", []):
-					if u not in collected:
-						collected.append(u)
-						if len(collected) >= 10:
-							break
-				if len(collected) >= 10:
-					break
-			if not collected:
-				res_all = _list_doc_urls(filter="atlan", limit=25, offset=0)
-				collected = res_all.get("urls", [])[:10]
-			ans = _answer_with_urls(question=q, urls=collected)
-			answer_text = (ans.get("answer", "") or "").strip()
-			sources = ans.get("sources") or collected
-			if sources and "Sources:" not in answer_text:
-				answer_text += "\n\nSources:\n" + "\n".join(sources[:10])
-			return answer_text
-		except Exception as e:
-			if RAG_DEBUG:
-				logging.error("Programmatic fallback error: %s", e)
-			return ""
-
-	# System instruction (stricter on retry)
-	ticket_model = firestore_ticket_to_model(snap)
-	base_sys = build_system_instruction(ticket_model) + "\nAUTO-ANSWER MODE: ALWAYS call list_doc_urls then answer_with_urls. Do NOT answer without citing tool-sourced URLs."
-	conv_objs = [ConversationMessage(sender="user", message=question_text, timestamp=now_ts())]
-	reply = ""
-	tool_calls: List[Dict[str, Any]] = []
-	answer_tool_used = False
-	for attempt in range(2):
-		local_sys = base_sys
-		if attempt == 1:
-			local_sys += "\nRETRY: You failed to ground answer. You MUST call list_doc_urls (possibly multiple filters) then answer_with_urls."
-		result = run_agent(question_text, conv_objs, system_instruction=local_sys)
-		reply = (result.get("reply", "") or "").strip()
-		tool_calls = result.get("tool_calls", []) or []
-		for call in tool_calls:
-			if call.get("tool") == "answer_with_urls":
-				answer_tool_used = True
-				res = call.get("result") or {}
-				urls = None
-				if isinstance(res.get("response"), dict):
-					urls = res.get("response", {}).get("used_urls")
-				if not urls:
-					urls = res.get("used_urls") or res.get("sources")
-				if urls and "Sources:" not in reply:
-					reply += "\n\nSources:\n" + "\n".join(urls[:10])
-				break
-		if answer_tool_used:
-			break
-
-	if not answer_tool_used:
-		fallback_answer = _programmatic_fallback(question_text)
-		if fallback_answer:
-			reply = fallback_answer
-
-	if not reply or reply.lower().startswith("(no response"):
-		cls_tags = normalize_topic_tags((data.get("classification") or {}).get("topic_tags", []))
-		primary = cls_tags[0] if cls_tags else "connector"
-		reply = f"RAG attempt failed (no grounded answer generated). This ticket has been classified as a '{primary}' issue and routed to the appropriate team."
-
-	add_message_to_ticket(ticket_doc_id, "agent", reply)
-	if RAG_DEBUG:
-		logging.info("RAG generation for %s | answer_tool_used=%s | reply_len=%d", ticket_doc_id, answer_tool_used, len(reply))
+	"""Deprecated: legacy function retained for compatibility no-op."""
+	return
 
 
 def save_ticket(subject: str, body: str, initial_message: Optional[str]) -> str:
@@ -858,57 +751,17 @@ def agent_query(req: AgentQueryRequest):
 	# No heuristic reordering now; rely solely on model liberal tagging per prompt.
 	primary_topic = normalized_tags[0] if normalized_tags else ""
 
-	# 3. Decide routing vs RAG purely from model-provided tags
-	use_rag = any(t in RAG_TOPICS for t in normalized_tags)
+	# 3. Conversational agent no longer triggers RAG; only ticket creation handles RAG.
+	use_rag = False
 	tool_calls: List[Dict[str, Any]] = []
 	used_urls: List[str] = []
 	reply = ""
 	routed = False
 
-	if use_rag and AI_ENABLED:
-		# Lightweight automatic doc selection using list_doc_urls heuristics over user query keywords.
-		from tools import list_doc_urls as _list, answer_with_urls as _anw
-		# Extract up to 5 meaningful keywords >3 chars (very naive)
-		import re
-		words = [w.lower() for w in re.findall(r"[A-Za-z0-9_-]+", req.user_message) if len(w) > 3]
-		seen_kw = []
-		for w in words:
-			if w in seen_kw:
-				continue
-			seen_kw.append(w)
-			res = _list(filter=w, limit=30, offset=0)
-			tool_calls.append({"tool": "list_doc_urls", "args": {"filter": w, "limit": 30}, "result": {"returned": res.get("returned"), "sample": res.get("urls", [])[:5]}})
-			for u in res.get("urls", []):
-				if u not in used_urls:
-					used_urls.append(u)
-					if len(used_urls) >= 10:
-						break
-			if len(used_urls) < 5:
-				# Fallback broad search if not enough
-				fallback = _list(filter="atlan", limit=20, offset=0)
-				tool_calls.append({"tool": "list_doc_urls", "args": {"filter": "atlan", "limit": 20}, "result": {"returned": fallback.get("returned")}})
-				for u in fallback.get("urls", []):
-					if u not in used_urls:
-						used_urls.append(u)
-						if len(used_urls) >= 10:
-							break
-		answer_payload = _anw(question=req.user_message, urls=used_urls)
-		tool_calls.append({"tool": "answer_with_urls", "args": {"question": req.user_message, "urls": used_urls}, "result": {"meta": answer_payload.get("meta", {}), "error": answer_payload.get("error")}})
-		ans_text = (answer_payload.get("answer", "") or "").strip()
-		sources = answer_payload.get("sources", used_urls)
-		if ans_text and sources and "Sources:" not in ans_text:
-			ans_text += "\n\nSources:\n" + "\n".join(sources)
-		# If still empty, route with reason
-		if not ans_text:
-			pretty_topic = primary_topic.title() if primary_topic else "General"
-			reply = f"RAG attempt failed (no grounded answer generated). This ticket has been classified as a '{pretty_topic.lower()}' issue and routed to the appropriate team."
-			routed = True
-		else:
-			reply = ans_text
-	else:
-		routed = True
-		pretty_topic = primary_topic.title() if primary_topic else "general"
-		reply = f"This ticket has been classified as a '{pretty_topic}' issue and routed to the appropriate team."
+	# Pure conversational response (echo / placeholder) without RAG
+	pretty_topic = primary_topic.title() if primary_topic else "General"
+	reply = f"(Conversational mode) Ticket topic: {pretty_topic}. Ask a follow-up or provide more details." if ticket_id else "This is the ticket copilot. Provide a ticket id or create a ticket to proceed."
+	routed = False
 
 	# 4. Persist conversation if we have a ticket id
 	if ticket_id:
