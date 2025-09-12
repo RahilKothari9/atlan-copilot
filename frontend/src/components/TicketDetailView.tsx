@@ -71,41 +71,41 @@ export function TicketDetailView({
           </div>
         </div>
 
-        {/* Classification badges */}
-        <div className="flex flex-wrap gap-2">
-          <Badge 
-            variant="secondary" 
-            className={cn("text-xs font-medium", priorityStyles[ticket.priority])}
-          >
-            {ticket.priority}
-          </Badge>
-          
-          <span className={cn("text-xs font-medium", sentimentStyles[ticket.sentiment])}>
-            {ticket.sentiment}
-          </span>
-          
-          {ticket.topics.map((topic, index) => (
+        {/* Classification badges (hide until classification complete) */}
+        {!ticket.isClassifying && (
+          <div className="flex flex-wrap gap-2">
             <Badge 
-              key={index}
-              variant="outline"
-              className={cn(
-                "text-xs border",
-                topicStyles[topic] || "bg-muted/20 text-muted-foreground border-muted"
-              )}
+              variant="secondary" 
+              className={cn("text-xs font-medium", priorityStyles[ticket.priority])}
             >
-              {topic}
+              {ticket.priority}
             </Badge>
-          ))}
-        </div>
+            <span className={cn("text-xs font-medium", sentimentStyles[ticket.sentiment])}>
+              {ticket.sentiment}
+            </span>
+            {ticket.topics.map((topic, index) => (
+              <Badge 
+                key={index}
+                variant="outline"
+                className={cn(
+                  "text-xs border",
+                  topicStyles[topic] || "bg-muted/20 text-muted-foreground border-muted"
+                )}
+              >
+                {topic}
+              </Badge>
+            ))}
+          </div>
+        )}
       </div>
 
       {/* Ticket content */}
       <ScrollArea className="flex-1 p-4">
         <div className="space-y-6">
           <TicketAnalysisPanel 
-            classification={{ topic_tags: ticket.topics.map(t=>t.toLowerCase()), sentiment: ticket.sentiment === 'Curious' ? 'Neutral' : ticket.sentiment, priority: ticket.priority === 'P0' ? 'P0 (High)' : ticket.priority === 'P1' ? 'P1 (Medium)' : 'P2 (Low)' }}
+            classification={ticket.isClassifying ? undefined : { topic_tags: ticket.topics.map(t=>t.toLowerCase()), sentiment: ticket.sentiment === 'Curious' ? 'Neutral' : ticket.sentiment, priority: ticket.priority === 'P0' ? 'P0 (High)' : ticket.priority === 'P1' ? 'P1 (Medium)' : 'P2 (Low)' }}
             agentMessage={ticket.conversation?.find(m=>m.sender==='agent')?.message || null}
-            loading={!ticket.conversation || ticket.conversation.length===0}
+            loading={ticket.isClassifying || (!ticket.conversation || ticket.conversation.length===0)}
           />
           <div>
             <h3 className="text-sm font-medium text-foreground mb-2">Original Ticket</h3>

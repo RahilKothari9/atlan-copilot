@@ -16,7 +16,7 @@ export const TicketAnalysisPanel: React.FC<Props> = ({ classification, agentMess
     <div className="space-y-4">
       <div className="border border-border rounded-md p-3">
         <h4 className="text-xs font-semibold mb-2 tracking-wide text-muted-foreground">Internal Analysis</h4>
-        {!classification && <p className="text-xs text-muted-foreground">Classifying…</p>}
+  {!classification && <p className="text-xs text-muted-foreground">Generating analysis…</p>}
         {classification && (
           <div className="text-xs space-y-2">
             <div className="flex gap-2 flex-wrap">

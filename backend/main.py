@@ -23,6 +23,7 @@ from __future__ import annotations
 import os
 import time
 import json
+import logging
 from typing import List, Optional, Dict, Any
 
 from fastapi import FastAPI, HTTPException, BackgroundTasks
@@ -76,6 +77,9 @@ if not firebase_admin._apps:  # type: ignore
 	firebase_admin.initialize_app(cred)
 
 db = firestore.client()  # Firestore client
+
+# Debug flags
+RAG_DEBUG = os.getenv("RAG_DEBUG", "false").lower() in {"1","true","yes"}
 
 
 # ----------------------------------------------------------------------------
@@ -651,6 +655,19 @@ TICKET TEXT:\n{ticket_text}\nJSON:
 	except Exception:
 		# Keep defaults on failure
 		pass
+
+	# Heuristic safety net: ensure a RAG tag when clearly instructional but model missed it
+	try:
+		lower_text = ticket_text.lower()
+		instr_patterns = [
+			"how do i", "how to", "set up", "setup", "configure", "configuration", "connect", "integration",
+			"integrate", "api", "sdk", "token", "key", "auth", "sso", "saml", "okta", "login", "enable", "steps"
+		]
+		if not any(t in {"how-to","product","best practices","api/sdk","sso"} for t in [x.lower() for x in classification.get("topic_tags", [])]):
+			if any(pat in lower_text for pat in instr_patterns):
+				classification["topic_tags"] = ["how-to"] + [t for t in classification.get("topic_tags", []) if t != "how-to"]
+	except Exception:
+		pass
 	# Persist using update_ticket helper for consistency
 	try:
 		updated = update_ticket(ticket_doc_id, {"classification": classification})
@@ -679,9 +696,7 @@ TICKET TEXT:\n{ticket_text}\nJSON:
 
 
 def _generate_rag_answer(ticket_doc_id: str):
-	"""Invoke the agent tool loop so the MODEL chooses URLs (no manual static list) and generate answer.
-	Skips if an agent message already exists.
-	"""
+	"""Attempt tool-grounded answer with retries & deterministic fallback; route with reason on failure."""
 	if not AI_ENABLED:
 		return
 	ref = db.collection(TICKETS_COLLECTION).document(ticket_doc_id)
@@ -690,31 +705,89 @@ def _generate_rag_answer(ticket_doc_id: str):
 		return
 	data = snap.to_dict() or {}
 	conversation = data.get("conversation", [])
+	# If an agent message already exists we skip to avoid duplicates
 	if any(m.get("sender") == "agent" for m in conversation):
 		return
 	question_text = data.get("body") or data.get("subject") or ""
 	if not question_text.strip():
 		return
-	# Build synthetic conversation and system instruction
+
+	def _programmatic_fallback(q: str) -> str:
+		"""Naive deterministic retrieval using list_doc_urls keywords then answer_with_urls."""
+		try:
+			from tools import list_doc_urls as _list_doc_urls, answer_with_urls as _answer_with_urls
+			import re as _re
+			words = [w.lower() for w in _re.findall(r"[A-Za-z0-9_-]+", q) if len(w) > 3][:12]
+			collected: list[str] = []
+			seen = set()
+			for w in words:
+				if w in seen:
+					continue
+				seen.add(w)
+				res = _list_doc_urls(filter=w, limit=40, offset=0)
+				for u in res.get("urls", []):
+					if u not in collected:
+						collected.append(u)
+						if len(collected) >= 10:
+							break
+				if len(collected) >= 10:
+					break
+			if not collected:
+				res_all = _list_doc_urls(filter="atlan", limit=25, offset=0)
+				collected = res_all.get("urls", [])[:10]
+			ans = _answer_with_urls(question=q, urls=collected)
+			answer_text = (ans.get("answer", "") or "").strip()
+			sources = ans.get("sources") or collected
+			if sources and "Sources:" not in answer_text:
+				answer_text += "\n\nSources:\n" + "\n".join(sources[:10])
+			return answer_text
+		except Exception as e:
+			if RAG_DEBUG:
+				logging.error("Programmatic fallback error: %s", e)
+			return ""
+
+	# System instruction (stricter on retry)
 	ticket_model = firestore_ticket_to_model(snap)
-	sys = build_system_instruction(ticket_model) + "\nAUTO-ANSWER MODE: You MUST call list_doc_urls (one or more times) then answer_with_urls for this ticket question. Do not answer without a tool-grounded citation list."
+	base_sys = build_system_instruction(ticket_model) + "\nAUTO-ANSWER MODE: ALWAYS call list_doc_urls then answer_with_urls. Do NOT answer without citing tool-sourced URLs."
 	conv_objs = [ConversationMessage(sender="user", message=question_text, timestamp=now_ts())]
-	result = run_agent(question_text, conv_objs, system_instruction=sys)
-	reply = result.get("reply", "")
-	tool_calls = result.get("tool_calls", []) or []
-	# If reply lacks Sources but tool_calls include answer_with_urls, patch in sources
-	if "Sources:" not in reply:
+	reply = ""
+	tool_calls: List[Dict[str, Any]] = []
+	answer_tool_used = False
+	for attempt in range(2):
+		local_sys = base_sys
+		if attempt == 1:
+			local_sys += "\nRETRY: You failed to ground answer. You MUST call list_doc_urls (possibly multiple filters) then answer_with_urls."
+		result = run_agent(question_text, conv_objs, system_instruction=local_sys)
+		reply = (result.get("reply", "") or "").strip()
+		tool_calls = result.get("tool_calls", []) or []
 		for call in tool_calls:
 			if call.get("tool") == "answer_with_urls":
+				answer_tool_used = True
 				res = call.get("result") or {}
-				urls = res.get("response", {}).get("used_urls") if isinstance(res.get("response"), dict) else res.get("used_urls")
+				urls = None
+				if isinstance(res.get("response"), dict):
+					urls = res.get("response", {}).get("used_urls")
 				if not urls:
-					urls = res.get("sources")
-				if urls:
+					urls = res.get("used_urls") or res.get("sources")
+				if urls and "Sources:" not in reply:
 					reply += "\n\nSources:\n" + "\n".join(urls[:10])
 				break
-	if reply:
-		add_message_to_ticket(ticket_doc_id, "agent", reply)
+		if answer_tool_used:
+			break
+
+	if not answer_tool_used:
+		fallback_answer = _programmatic_fallback(question_text)
+		if fallback_answer:
+			reply = fallback_answer
+
+	if not reply or reply.lower().startswith("(no response"):
+		cls_tags = normalize_topic_tags((data.get("classification") or {}).get("topic_tags", []))
+		primary = cls_tags[0] if cls_tags else "connector"
+		reply = f"RAG attempt failed (no grounded answer generated). This ticket has been classified as a '{primary}' issue and routed to the appropriate team."
+
+	add_message_to_ticket(ticket_doc_id, "agent", reply)
+	if RAG_DEBUG:
+		logging.info("RAG generation for %s | answer_tool_used=%s | reply_len=%d", ticket_doc_id, answer_tool_used, len(reply))
 
 
 def save_ticket(subject: str, body: str, initial_message: Optional[str]) -> str:
@@ -821,11 +894,17 @@ def agent_query(req: AgentQueryRequest):
 							break
 		answer_payload = _anw(question=req.user_message, urls=used_urls)
 		tool_calls.append({"tool": "answer_with_urls", "args": {"question": req.user_message, "urls": used_urls}, "result": {"meta": answer_payload.get("meta", {}), "error": answer_payload.get("error")}})
-		ans_text = answer_payload.get("answer", "")
+		ans_text = (answer_payload.get("answer", "") or "").strip()
 		sources = answer_payload.get("sources", used_urls)
-		if sources and "Sources:" not in ans_text:
+		if ans_text and sources and "Sources:" not in ans_text:
 			ans_text += "\n\nSources:\n" + "\n".join(sources)
-		reply = ans_text or "(No answer generated)"
+		# If still empty, route with reason
+		if not ans_text:
+			pretty_topic = primary_topic.title() if primary_topic else "General"
+			reply = f"RAG attempt failed (no grounded answer generated). This ticket has been classified as a '{pretty_topic.lower()}' issue and routed to the appropriate team."
+			routed = True
+		else:
+			reply = ans_text
 	else:
 		routed = True
 		pretty_topic = primary_topic.title() if primary_topic else "general"

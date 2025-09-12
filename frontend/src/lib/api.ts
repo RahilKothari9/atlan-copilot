@@ -76,17 +76,18 @@ export async function agentQuery(user_message: string, ticket_id?: string, conve
 
 export function mapBackendTicket(t: BackendTicket) {
   // Map backend classification to UI Ticket shape
-  const classification = t.classification || {};
-  const rawPri = classification.priority || 'P2 (Low)';
+  const cls = t.classification || {};
+  const rawPri = cls.priority || 'P2 (Low)';
   const priority = rawPri.startsWith('P0') ? 'P0' : rawPri.startsWith('P1') ? 'P1' : 'P2';
   const sentimentMap: Record<string, string> = {
     Positive: 'Curious',
     Neutral: 'Neutral',
     Negative: 'Frustrated',
   };
-  const sentiment = sentimentMap[classification.sentiment || 'Neutral'] || 'Neutral';
+  const rawSentiment = cls.sentiment || 'Neutral';
+  const sentiment = sentimentMap[rawSentiment] || (rawSentiment === 'Unknown' ? 'Neutral' : 'Neutral');
   // Normalize topic tags (may be list or stringified list)
-  let topicTags: any = classification.topic_tags || [];
+  let topicTags: any = cls.topic_tags || [];
   if (typeof topicTags === 'string') {
     const trimmed = topicTags.trim();
     if (trimmed.startsWith('[') && trimmed.endsWith(']')) {
@@ -116,6 +117,7 @@ export function mapBackendTicket(t: BackendTicket) {
     'snowflake': 'Connector',
   };
   const topics = topicsRaw.map(x => topicMap[x] || (x.charAt(0).toUpperCase()+x.slice(1)));
+  const isClassifying = (!(Array.isArray(topicTags) && topicTags.length)) || (cls.sentiment === 'Unknown');
   return {
     id: t.id,
     title: t.subject,
@@ -125,7 +127,7 @@ export function mapBackendTicket(t: BackendTicket) {
     topics,
     timestamp: new Date(t.createdAt*1000).toISOString(),
     timeAgo: '—',
-    isClassifying: !(Array.isArray(topicTags) && topicTags.length),
+  isClassifying,
   };
 }
 
