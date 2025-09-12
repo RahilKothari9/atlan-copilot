@@ -1,7 +1,7 @@
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
-
+@import url('https://fonts.googleapis.com/css2?family=Questrial&display=swap');
 /* Atlan Support Copilot Design System - Dark Theme Professional UI */
 
 @layer base {
