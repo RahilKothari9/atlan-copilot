@@ -247,6 +247,7 @@ def answer_question(question: str) -> Dict[str, Any]:
         "You are Atlan's support assistant. Use ONLY the provided documentation excerpts. "
         "If the question is procedural, give concise numbered steps. Provide factual, current info. "
         "After answering add a blank line then 'Sources:' each on its own line. If insufficient context, say you cannot fully answer and still cite sources.\n" 
+        "If you feel the question is not of the topic is How-to, Product, Best practices, API/SDK, or SSO and its not a question you can answer from the documentation, answer with This ticket has been classified as a (put the topic tag here) issue and routed to the appropriate team."
         f"Question: {question}\n\nContext Documents:\n{chr(10).join(contexts)}\nAnswer:\n"
     )
     try:

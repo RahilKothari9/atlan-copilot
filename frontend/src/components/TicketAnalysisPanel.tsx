@@ -1,6 +1,7 @@
 import React from 'react';
 import { Badge } from '@/components/ui/badge';
 import { cn } from '@/lib/utils';
+import { parseSourcesFromReply } from '@/lib/api';
 
 interface Props {
   classification: { topic_tags?: string[]; sentiment?: string; priority?: string } | undefined;
@@ -12,6 +13,17 @@ const priorityColor: Record<string,string> = { 'P0 (High)': 'bg-priority-p0 text
 
 export const TicketAnalysisPanel: React.FC<Props> = ({ classification, agentMessage, loading }) => {
   const tags = classification?.topic_tags || [];
+  let answer = agentMessage || '';
+  let sources: { title: string; url: string }[] = [];
+  if (agentMessage) {
+    sources = parseSourcesFromReply(agentMessage);
+    if (sources.length) {
+      const splitIdx = answer.toLowerCase().lastIndexOf('sources:');
+      if (splitIdx !== -1) {
+        answer = answer.slice(0, splitIdx).trimEnd();
+      }
+    }
+  }
   return (
     <div className="space-y-4">
       <div className="border border-border rounded-md p-3">
@@ -30,7 +42,25 @@ export const TicketAnalysisPanel: React.FC<Props> = ({ classification, agentMess
       <div className="border border-border rounded-md p-3">
         <h4 className="text-xs font-semibold mb-2 tracking-wide text-muted-foreground">Final Response</h4>
         {loading && !agentMessage && <p className="text-xs text-muted-foreground">Generating response…</p>}
-        {agentMessage && <div className="text-xs whitespace-pre-wrap leading-relaxed">{agentMessage}</div>}
+        {agentMessage && (
+          <div className="space-y-3">
+            <div className="text-xs whitespace-pre-wrap leading-relaxed">{answer}</div>
+            {sources.length > 0 && (
+              <div>
+                <div className="text-[10px] font-semibold tracking-wide text-muted-foreground mb-1 uppercase">Sources</div>
+                <ul className="space-y-1">
+                  {sources.map(s => (
+                    <li key={s.url} className="text-[11px]">
+                      <a href={s.url} target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:underline break-all">
+                        {s.url}
+                      </a>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
+          </div>
+        )}
         {!loading && !agentMessage && <p className="text-xs text-muted-foreground">—</p>}
       </div>
     </div>

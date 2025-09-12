@@ -599,7 +599,7 @@ def classify_and_update(ticket_doc_id: str, ticket_text: str):
 	prompt = f"""
 You classify support tickets. Return STRICT JSON only.
 Keys:
-	topic_tags: array 1-5 lowercase tags. ALWAYS include a RAG tag (how-to, product, best practices, api/sdk, sso) FIRST when user asks for steps, setup, configuration, integration, authentication, API usage, optimization, troubleshooting, tokens, SSO, security setup.
+	topic_tags: array 1-5 lowercase tags. ALWAYS include a RAG tag (how-to, product, best practices, api/sdk, sso) FIRST when user asks for steps, setup, configuration, integration, authentication, API usage, optimization, troubleshooting, tokens, SSO, security setup basically product or technical question.
 	sentiment: Positive | Neutral | Negative.
 	priority: 'P0 (High)' | 'P1 (Medium)' | 'P2 (Low)'.
 Vendor how-to example: "How do I connect to Snowflake" => ["how-to","snowflake","connector"].
@@ -632,19 +632,6 @@ TICKET TEXT:\n{ticket_text}\nJSON:
 		# Keep defaults on failure
 		pass
 
-	# Heuristic safety net: ensure a RAG tag when clearly instructional but model missed it
-	try:
-		lower_text = ticket_text.lower()
-		instr_patterns = [
-			"how do i", "how to", "set up", "setup", "configure", "configuration", "connect", "integration",
-			"integrate", "api", "sdk", "token", "key", "auth", "sso", "saml", "okta", "login", "enable", "steps"
-		]
-		if not any(t in {"how-to","product","best practices","api/sdk","sso"} for t in [x.lower() for x in classification.get("topic_tags", [])]):
-			if any(pat in lower_text for pat in instr_patterns):
-				classification["topic_tags"] = ["how-to"] + [t for t in classification.get("topic_tags", []) if t != "how-to"]
-	except Exception:
-		pass
-	# Persist using update_ticket helper for consistency
 	try:
 		updated = update_ticket(ticket_doc_id, {"classification": classification})
 	except Exception:
