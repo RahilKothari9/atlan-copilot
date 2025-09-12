@@ -831,33 +831,35 @@ def agent_query(req: AgentQueryRequest):
 
 	# Never return the ambiguous placeholder. If empty or placeholder, synthesize diagnostics.
 	if not reply or reply.lower().startswith("(no response"):
-		reasons: List[str] = []
 		called = [c.get("tool") for c in tool_calls if c.get("tool")]
+		# Summarize tool errors/results and dedupe repeated messages
+		summary = {}
+		for c in tool_calls:
+			tool = c.get("tool")
+			res = c.get("result")
+			if isinstance(res, dict) and res.get("error"):
+				summary.setdefault(tool, []).append(f"error: {res.get('error')}")
+			elif isinstance(res, dict) and res.get("returned") == 0:
+				summary.setdefault(tool, []).append("no results")
+			elif isinstance(res, list) and len(res) == 0:
+				summary.setdefault(tool, []).append("empty list")
+		parts = []
 		if not tool_calls:
-			reasons.append("The model produced no output and made no tool calls.")
+			parts.append("Model produced no output and made no tool calls.")
 		else:
-			# Inspect tool call results for explicit errors or empty returns
-			for c in tool_calls:
-				tool = c.get("tool")
-				res = c.get("result")
-				if isinstance(res, dict) and res.get("error"):
-					reasons.append(f"Tool '{tool}' returned error: {res.get('error')}")
-				elif isinstance(res, dict) and res.get("returned") == 0:
-					reasons.append(f"Tool '{tool}' returned zero results.")
-				elif isinstance(res, list) and len(res) == 0:
-					reasons.append(f"Tool '{tool}' returned an empty list.")
-		if not reasons:
-			reasons.append("The model returned an empty reply; check model connectivity or API quota.")
+			for tool, msgs in summary.items():
+				uniq = sorted(set(msgs))
+				parts.append(f"{tool}: {', '.join(uniq)}")
+		if not parts:
+			parts.append("Model returned no content; check model connectivity or quota.")
 
-		diag = "; ".join(reasons)
-		pretty_topic = ""
-		if ticket_id:
-			pretty_topic = (classification.get("topic_tags") or [""])[0] if classification else ""
-		synthetic = (
-			f"Agent could not generate an answer. Reasons: {diag}. "
-			f"Tools invoked: {', '.join(called) if called else 'none'}."
+		# Friendly guidance
+		guidance = (
+			"If you expected ticket results, ensure Firestore indexes are configured (see /firestore.indexes.json) "
+			"or run the client-side fallback by calling the tickets query directly."
 		)
-		reply = synthetic
+
+		reply = "Agent could not generate an answer. " + " ".join(parts) + " " + guidance
 
 	# Persist conversation if we have a ticket id
 	if ticket_id and reply:
