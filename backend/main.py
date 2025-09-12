@@ -174,6 +174,7 @@ def firestore_ticket_to_model(doc: firestore.DocumentSnapshot) -> TicketResponse
 # ----------------------------------------------------------------------------
 # Legacy tool-based RAG removed; new RAG pipeline handled separately at ticket creation
 from rag import answer_question, build_index, index_status  # embedding-based RAG
+import re
 try:  # Firestore FieldFilter (new style). Fallback to None if unavailable.
 	from google.cloud.firestore_v1 import FieldFilter  # type: ignore
 except Exception:  # pragma: no cover
@@ -187,32 +188,51 @@ def fetch_tickets(filters: Optional[Dict[str, Any]] = None) -> List[Dict[str, An
 	Supported filters: status, priority, sentiment.
 	"""
 	query = db.collection(TICKETS_COLLECTION)
+	status = priority = sentiment = None
 	if filters:
 		status = filters.get("status")
 		priority = filters.get("priority")
 		sentiment = filters.get("sentiment")
-		# Use new FieldFilter if available; otherwise fall back to legacy positional form.
-		if FieldFilter:
-			if status:
-				query = query.where(filter=FieldFilter("status", "==", status))
-			if priority:
-				query = query.where(filter=FieldFilter("classification.priority", "==", priority))
-			if sentiment:
-				query = query.where(filter=FieldFilter("classification.sentiment", "==", sentiment))
-		else:  # Fallback (may emit warning)
-			if status:
-				query = query.where("status", "==", status)
-			if priority:
-				query = query.where("classification.priority", "==", priority)
-			if sentiment:
-				query = query.where("classification.sentiment", "==", sentiment)
 	try:
-		# Order newest first
-		query = query.order_by("createdAt", direction=firestore.Query.DESCENDING)  # type: ignore
+		if filters:
+			# Use Firestore filtering path first; may raise index error which we'll catch.
+			if FieldFilter:
+				if status:
+					query = query.where(filter=FieldFilter("status", "==", status))
+				if priority:
+					query = query.where(filter=FieldFilter("classification.priority", "==", priority))
+				if sentiment:
+					query = query.where(filter=FieldFilter("classification.sentiment", "==", sentiment))
+			else:
+				if status:
+					query = query.where("status", "==", status)
+				if priority:
+					query = query.where("classification.priority", "==", priority)
+				if sentiment:
+					query = query.where("classification.sentiment", "==", sentiment)
+		try:
+			query = query.order_by("createdAt", direction=firestore.Query.DESCENDING)  # type: ignore
+		except Exception:
+			pass
+		# Primary path
+		docs = query.limit(50).stream()
+		return [firestore_ticket_to_model(d).dict() for d in docs]
 	except Exception:
-		pass  # Fallback silently if ordering not supported
-	docs = query.limit(50).stream()
-	return [firestore_ticket_to_model(d).dict() for d in docs]
+		# Index or query failure fallback: client-side filter
+		all_docs = db.collection(TICKETS_COLLECTION).stream()
+		rows = [firestore_ticket_to_model(d).dict() for d in all_docs]
+		def _match(row: Dict[str, Any]) -> bool:
+			cl = (row.get("classification") or {})
+			if status and row.get("status") != status:
+				return False
+			if priority and cl.get("priority") != priority:
+				return False
+			if sentiment and cl.get("sentiment") != sentiment:
+				return False
+			return True
+		filtered = [r for r in rows if _match(r)] if filters else rows
+		filtered.sort(key=lambda r: r.get("createdAt", 0), reverse=True)
+		return filtered[:50]
 
 
 def update_ticket(ticket_id: str, updates: Dict[str, Any]) -> Dict[str, Any]:
@@ -235,6 +255,7 @@ def delete_ticket(ticket_id: str) -> Dict[str, Any]:
 
 
 def add_message_to_ticket(ticket_id: str, sender: str, message: str) -> Dict[str, Any]:
+	"""Internal helper (kept) to append conversation messages."""
 	if sender not in {"user", "agent"}:
 		raise ValueError("sender must be 'user' or 'agent'")
 	ref = db.collection(TICKETS_COLLECTION).document(ticket_id)
@@ -245,13 +266,63 @@ def add_message_to_ticket(ticket_id: str, sender: str, message: str) -> Dict[str
 	ref.update({"conversation": firestore.ArrayUnion([msg]), "updatedAt": now_ts()})
 	return msg
 
+def get_ticket_tool(ticket_id: str) -> Dict[str, Any]:
+	"""Tool: fetch a single ticket by id with full details."""
+	ref = db.collection(TICKETS_COLLECTION).document(ticket_id)
+	snap = ref.get()
+	if not snap.exists:
+		raise ValueError("Ticket not found")
+	return firestore_ticket_to_model(snap).dict()
+
+def search_tickets(query: str) -> Dict[str, Any]:
+	"""Tool: naive substring search over recent tickets (subject/body) returning lightweight matches."""
+	q = (query or "").strip().lower()
+	if not q:
+		return {"matches": []}
+	all_tickets = fetch_tickets({})
+	matches = []
+	for t in all_tickets:
+		subj = t.get("subject", "").lower()
+		body = t.get("body", "").lower()
+		if q in subj or q in body:
+			matches.append({
+				"id": t.get("id"),
+				"subject": t.get("subject"),
+				"priority": (t.get("classification", {}) or {}).get("priority"),
+				"sentiment": (t.get("classification", {}) or {}).get("sentiment"),
+				"tags": (t.get("classification", {}) or {}).get("topic_tags"),
+			})
+		if len(matches) >= 25:
+			break
+	return {"query": query, "count": len(matches), "matches": matches}
+
+
+def aggregate_tickets(filters: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+	"""Return simple aggregates and lightweight list for given filters (priority/sentiment/status).
+
+	Example: { filters: { priority: 'P2 (Low)' } }
+	"""
+	try:
+		rows = fetch_tickets(filters or {})
+		return {
+			"count": len(rows),
+			"samples": [
+				{"id": r.get("id"), "subject": r.get("subject"), "priority": (r.get("classification") or {}).get("priority")}
+				for r in rows[:25]
+			],
+		}
+	except Exception as e:
+		return {"count": 0, "samples": [], "error": str(e)}
+
 
 TOOL_REGISTRY = {
-	# Only ticket management tools remain for conversational agent
+	# Conversational agent tooling (no doc/RAG tools here)
 	"fetch_tickets": fetch_tickets,
+	"get_ticket": get_ticket_tool,
+	"search_tickets": search_tickets,
+	"aggregate_tickets": aggregate_tickets,
 	"update_ticket": update_ticket,
 	"delete_ticket": delete_ticket,
-	"add_message_to_ticket": add_message_to_ticket,
 }
 
 # Build Gemini tool/function declarations (schema minimal but explicit)
@@ -261,7 +332,7 @@ def _build_tool_declarations():
 	fds = [
 		FunctionDeclaration(
 			name="fetch_tickets",
-			description="Fetch up to 50 tickets optionally filtered by status, priority, sentiment.",
+			description="Fetch up to 50 recent tickets; optionally filter by status, priority, sentiment.",
 			parameters={
 				"type": "object",
 				"properties": {
@@ -277,8 +348,34 @@ def _build_tool_declarations():
 			},
 		),
 		FunctionDeclaration(
+			name="get_ticket",
+			description="Get full details of a single ticket by id (subject, body, classification, conversation).",
+			parameters={
+				"type": "object",
+				"properties": {"ticket_id": {"type": "string"}},
+				"required": ["ticket_id"],
+			},
+		),
+		FunctionDeclaration(
+			name="search_tickets",
+			description="Substring search across recent ticket subjects and bodies; returns lightweight matches.",
+			parameters={
+				"type": "object",
+				"properties": {"query": {"type": "string"}},
+				"required": ["query"],
+			},
+		),
+		FunctionDeclaration(
+			name="aggregate_tickets",
+			description="Return counts and sample tickets for given filters (priority/sentiment/status).",
+			parameters={
+				"type": "object",
+				"properties": {"filters": {"type": "object"}},
+			},
+		),
+		FunctionDeclaration(
 			name="update_ticket",
-			description="Update ticket fields including classification or status.",
+			description="Update ticket fields (status, classification, etc.).",
 			parameters={
 				"type": "object",
 				"properties": {
@@ -295,19 +392,6 @@ def _build_tool_declarations():
 				"type": "object",
 				"properties": {"ticket_id": {"type": "string"}},
 				"required": ["ticket_id"],
-			},
-		),
-		FunctionDeclaration(
-			name="add_message_to_ticket",
-			description="Append a message to a ticket conversation.",
-			parameters={
-				"type": "object",
-				"properties": {
-					"ticket_id": {"type": "string"},
-					"sender": {"type": "string", "enum": ["user", "agent"]},
-					"message": {"type": "string"},
-				},
-				"required": ["ticket_id", "sender", "message"],
 			},
 		),
 	]
@@ -530,12 +614,22 @@ def build_system_instruction(ticket: Optional[TicketResponse]) -> str:
 	- Output and logging requirements.
 	"""
 	core = (
-		"You are Atlan's Customer Support Conversational Copilot. RAG answers are generated only at ticket creation by a separate pipeline.\n"
-		"Your responsibilities:\n"
-		"1. Provide helpful, concise conversational guidance based on existing ticket context (do NOT fetch docs).\n"
-		"2. Update classification only if clearly incorrect using update_ticket.\n"
-		"3. Never fabricate documentation citations; do not output a Sources section.\n"
-		"4. Encourage user to add details if information is insufficient.\n"
+		"You are Atlan's Customer Support Conversational Copilot.\n"
+		"A separate pipeline already produced any initial RAG answer when the ticket was created. \n"
+		"TOOLS AVAILABLE:\n"
+		"- fetch_tickets(filters?): list recent tickets (optionally filter by status, priority, sentiment).\n"
+		"- get_ticket(ticket_id): fetch full ticket detail.\n"
+		"- search_tickets(query): substring search across recent ticket subjects & bodies.\n"
+		"- update_ticket(ticket_id, updates): adjust status or classification (topic_tags, sentiment, priority).\n"
+		"- delete_ticket(ticket_id): remove a ticket (only if user explicitly requests deletion).\n"
+		"USAGE PATTERNS:\n"
+		"* When user asks analytics (e.g., 'list P0 tickets', 'how many negative sentiment tickets?'): call fetch_tickets (maybe multiple times) then summarize.\n"
+		"* When user references a ticket id: use get_ticket for precise data.\n"
+		"* For keyword queries (e.g., 'tickets about snowflake'): call search_tickets.\n"
+		"* Only call update_ticket if the user explicitly asks to change something or if classification is clearly wrong.\n"
+		"OUTPUT FORMAT:\n"
+		"Provide concise natural language; for lists use bullet points with 'ID – subject (priority | sentiment | tags)'.\n"
+		"DO NOT cite documentation URLs or fabricate sources.\n"
 	)
 	if ticket:
 		core += (
@@ -705,55 +799,69 @@ def save_ticket(subject: str, body: str, initial_message: Optional[str]) -> str:
 
 @app.post("/agent_query", response_model=AgentQueryResponse)
 def agent_query(req: AgentQueryRequest):
-	# -----------------------------
-	# Automatic gating + RAG logic
-	# -----------------------------
 	ticket_id = req.ticket_id
 	classification: Dict[str, Any] = {}
-	primary_topic = ""
-	# 1. Load ticket & ensure classification if ticket id provided
+	conversation_history: List[ConversationMessage] = []
+	ticket_ctx: Optional[TicketResponse] = None
 	if ticket_id:
 		snap = db.collection(TICKETS_COLLECTION).document(ticket_id).get()
 		if not snap.exists:
 			raise HTTPException(status_code=404, detail="Ticket not found")
-		t = firestore_ticket_to_model(snap)
-		classification = t.classification or {}
-		if AI_ENABLED and not classification.get("topic_tags"):
-			try:
-				classification = classify_ticket(t.subject, t.body)
-				update_ticket(ticket_id, {"classification": classification})
-			except Exception:
-				pass
+		ticket_ctx = firestore_ticket_to_model(snap)
+		classification = ticket_ctx.classification or {}
+		# Persist user message immediately for history continuity
+		try:
+			add_message_to_ticket(ticket_id, "user", req.user_message)
+		except Exception:
+			pass
+		conversation_history = ticket_ctx.conversation
 	else:
-		# Ad-hoc question without ticket: classify the question text itself (subject surrogate).
+		# Ad-hoc classification
 		if AI_ENABLED:
 			classification = classify_ticket(req.user_message[:60], req.user_message)
 		else:
 			classification = {"topic_tags": [], "sentiment": "Neutral", "priority": "P2 (Low)"}
 
-	# 2. Normalize & pick primary topic
-	raw_tags = classification.get("topic_tags", []) or []
-	normalized_tags = normalize_topic_tags(raw_tags)
-	# Apply prioritization heuristic to bias toward RAG-eligible topics
-	# No heuristic reordering now; rely solely on model liberal tagging per prompt.
-	primary_topic = normalized_tags[0] if normalized_tags else ""
+	# Build system instruction with ticket context if available
+	sys_instr = build_system_instruction(ticket_ctx)
+	result = run_agent(req.user_message, conversation_history, system_instruction=sys_instr)
+	raw_reply = (result.get("reply") or "")
+	reply = raw_reply.strip()
+	tool_calls = result.get("tool_calls") or []
 
-	# 3. Conversational agent no longer triggers RAG; only ticket creation handles RAG.
-	use_rag = False
-	tool_calls: List[Dict[str, Any]] = []
-	used_urls: List[str] = []
-	reply = ""
-	routed = False
+	# Never return the ambiguous placeholder. If empty or placeholder, synthesize diagnostics.
+	if not reply or reply.lower().startswith("(no response"):
+		reasons: List[str] = []
+		called = [c.get("tool") for c in tool_calls if c.get("tool")]
+		if not tool_calls:
+			reasons.append("The model produced no output and made no tool calls.")
+		else:
+			# Inspect tool call results for explicit errors or empty returns
+			for c in tool_calls:
+				tool = c.get("tool")
+				res = c.get("result")
+				if isinstance(res, dict) and res.get("error"):
+					reasons.append(f"Tool '{tool}' returned error: {res.get('error')}")
+				elif isinstance(res, dict) and res.get("returned") == 0:
+					reasons.append(f"Tool '{tool}' returned zero results.")
+				elif isinstance(res, list) and len(res) == 0:
+					reasons.append(f"Tool '{tool}' returned an empty list.")
+		if not reasons:
+			reasons.append("The model returned an empty reply; check model connectivity or API quota.")
 
-	# Pure conversational response (echo / placeholder) without RAG
-	pretty_topic = primary_topic.title() if primary_topic else "General"
-	reply = f"(Conversational mode) Ticket topic: {pretty_topic}. Ask a follow-up or provide more details." if ticket_id else "This is the ticket copilot. Provide a ticket id or create a ticket to proceed."
-	routed = False
+		diag = "; ".join(reasons)
+		pretty_topic = ""
+		if ticket_id:
+			pretty_topic = (classification.get("topic_tags") or [""])[0] if classification else ""
+		synthetic = (
+			f"Agent could not generate an answer. Reasons: {diag}. "
+			f"Tools invoked: {', '.join(called) if called else 'none'}."
+		)
+		reply = synthetic
 
-	# 4. Persist conversation if we have a ticket id
-	if ticket_id:
+	# Persist conversation if we have a ticket id
+	if ticket_id and reply:
 		try:
-			add_message_to_ticket(ticket_id, "user", req.user_message)
 			add_message_to_ticket(ticket_id, "agent", reply)
 		except Exception:
 			pass
@@ -763,8 +871,7 @@ def agent_query(req: AgentQueryRequest):
 		tool_calls=tool_calls,
 		ticket_id=ticket_id,
 		classification=classification,
-		used_urls=used_urls,
-		routed=routed,
+		routed=False,
 	)
 
 
