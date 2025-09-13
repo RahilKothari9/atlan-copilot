@@ -1,4 +1,4 @@
-# Atlan AI Helpdesk (RAG + Tool-Enabled Agent)
+# Atlan Support Copilot (RAG + Tool-Enabled Agent)
 
 > Production-style prototype: FastAPI + Firestore backend, embedding-based RAG at ticket creation, React (Vite) frontend, Gemini model for classification & agentic tooling.
 
