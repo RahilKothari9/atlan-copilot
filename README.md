@@ -19,20 +19,19 @@ Core goals achieved:
 ---
 ## 2. Architecture Diagram
 ```mermaid
-graph TD
-  A[React Frontend (Vite)] -->|REST JSON| B[FastAPI Backend]
-  B -->|Firestore Admin SDK| C[(Firestore)]
-  B -->|Embeddings & Generation| D[Gemini API]
-  B -->|Persisted JSON| E[r ag_index.json]
-  subgraph RAG Pipeline (ticket creation only)
-    B --> F[Embed Docs / Build Index]
+flowchart TD
+  A[Frontend (React/Vite)] --> B[FastAPI Backend]
+  B --> C[(Firestore)]
+  B --> D[Gemini API]
+  B --> E[(rag_index.json)]
+  subgraph RAG_Pipeline
+    B --> F[Build Index]
     F --> E
-    B --> G[Retrieve Top-k]
+    B --> G[Retrieve + Generate]
     G --> D
-    D --> B
   end
-  subgraph Agent Tool Loop (analytics queries)
-    B <--> H[fetch_tickets / get_ticket / search / aggregate / update / delete]
+  subgraph Agent_Tools
+    B <--> H[Ticket Tools]
     H --> C
   end
 ```
