@@ -10,7 +10,6 @@ firebase-admin==6.5.0
 python-dotenv==1.0.1
 google-generativeai==0.7.2
 pydantic==2.7.4
-watchfiles==0.21.0
 requests==2.32.3
 
 # Direct pins to narrow resolver space for Google libs
