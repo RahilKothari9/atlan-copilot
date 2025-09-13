@@ -1,25 +1,7 @@
-############################################################
-# Pinned dependencies for stable deployment (Render / prod) #
-# Rationale: Unpinned google + fastapi stack caused pip     #
-# resolution backtracking (resolution-too-deep).            #
-############################################################
-
-fastapi==0.110.2
-uvicorn[standard]==0.30.3
-firebase-admin==6.5.0
-python-dotenv==1.0.1
-google-generativeai==0.7.2
-pydantic==2.7.4
-requests==2.32.3
-
-# Direct pins to narrow resolver space for Google libs
-protobuf==4.25.3
-google-api-core==2.19.1
-google-auth==2.34.0
-
-# (Optional) If further conflicts arise, add:
-# google-cloud-firestore==2.16.0
-# grpcio==1.64.1
-
-# Dev / local convenience (comment out in minimal prod):
-# httpx==0.27.2
+fastapi
+uvicorn[standard]
+firebase-admin
+python-dotenv
+google-generativeai
+pydantic
+requests
