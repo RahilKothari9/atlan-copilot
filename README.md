@@ -235,7 +235,7 @@ Add a `tests/` folder with:
 
 ---
 ## 13. Deployment URL & Repo
-- Live App: (Add once deployed)
+- Live App: https://atlan-copilot.vercel.app/
 - Repository: https://github.com/RahilKothari9/atlan-copilot
 
 ---
