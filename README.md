@@ -20,7 +20,7 @@ Core goals achieved:
 ## 2. Architecture Diagram
 ```mermaid
 flowchart TD
-  A[Frontend (React/Vite)] --> B[FastAPI Backend]
+  A[React Frontend] --> B[FastAPI Backend]
   B --> C[(Firestore)]
   B --> D[Gemini API]
   B --> E[(rag_index.json)]
