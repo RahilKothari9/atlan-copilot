@@ -128,6 +128,8 @@ export function mapBackendTicket(t: BackendTicket) {
     timestamp: new Date(t.createdAt*1000).toISOString(),
     timeAgo: '—',
   isClassifying,
+  // Ensure conversation always present for downstream type consistency
+  conversation: t.conversation || [],
   };
 }
 

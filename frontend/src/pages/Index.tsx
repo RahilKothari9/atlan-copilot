@@ -19,6 +19,11 @@ export default function Index() {
   const { ticketsQuery, createTicket, creating, deleteTicket, updateTicket } = useTickets();
   const [selectedTicket, setSelectedTicket] = useState<Ticket | null>(null);
   const ticketDetail = useTicketDetail(selectedTicket?.id);
+
+  // Always try to use the freshest ticket object from the tickets query (so classification updates propagate)
+  const liveSelectedTicket = selectedTicket
+    ? (ticketsQuery.data || []).find(t => t.id === selectedTicket.id) || selectedTicket
+    : null;
   const [viewState, setViewState] = useState<ViewState>({ type: "chat" });
   const { messages, send, loading, setMessages } = useAgentChat(selectedTicket?.id);
   const [filters, setFilters] = useState<FilterState>({
@@ -142,13 +147,23 @@ export default function Index() {
               isLoading={loading}
             />
           ) : (
-            <TicketDetailView
-              ticket={{ ...viewState.ticket, conversation: ticketDetail.data?.conversation || viewState.ticket.conversation }}
-              onBack={handleBackToChat}
-              onUpdate={handleUpdateTicket}
-              onDelete={handleDeleteTicket}
-              onAskAI={handleAskAI}
-            />
+            (() => {
+              // Prefer the freshest classification from ticketDetail (faster 3s poll) else live list else snapshot
+              const base = ticketDetail.data || liveSelectedTicket || viewState.ticket;
+              const merged = {
+                ...base,
+                conversation: ticketDetail.data?.conversation || base?.conversation || [],
+              } as Ticket;
+              return (
+                <TicketDetailView
+                  ticket={merged}
+                  onBack={handleBackToChat}
+                  onUpdate={handleUpdateTicket}
+                  onDelete={handleDeleteTicket}
+                  onAskAI={handleAskAI}
+                />
+              );
+            })()
           )}
         </div>
       </div>
