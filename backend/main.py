@@ -478,6 +478,95 @@ def normalize_topic_tags(raw: List[str]) -> List[str]:
 	return out[:3]
 
 
+def normalize_priority(val: Optional[str]) -> Optional[str]:
+	if val is None:
+		return None
+	s = str(val).strip().lower()
+	if not s:
+		return None
+	# common patterns
+	if "p0" in s or "high" in s or s == "0":
+		return "P0 (High)"
+	if "p1" in s or "medium" in s or s == "1":
+		return "P1 (Medium)"
+	if "p2" in s or "low" in s or s == "2":
+		return "P2 (Low)"
+	# If already canonical-ish, try to match
+	if "p0 (high)" in s:
+		return "P0 (High)"
+	if "p1 (medium)" in s:
+		return "P1 (Medium)"
+	if "p2 (low)" in s:
+		return "P2 (Low)"
+	return val
+
+
+def normalize_sentiment(val: Optional[str]) -> Optional[str]:
+	if val is None:
+		return None
+	s = str(val).strip().lower()
+	if not s:
+		return None
+	if s.startswith("pos") or "positive" in s:
+		return "Positive"
+	if s.startswith("neg") or "negative" in s:
+		return "Negative"
+	if "neutral" in s:
+		return "Neutral"
+	return val
+
+
+def _normalize_tool_args(name: Optional[str], args: Dict[str, Any]) -> Dict[str, Any]:
+	"""Normalize common argument names and canonicalize priority/sentiment values.
+
+	This helps when the model emits shorthand like 'P2' or lowercase values.
+	"""
+	if not args:
+		return args
+	out = dict(args)
+	try:
+		# Normalize ticket id key variants
+		if "ticket_id" not in out and "id" in out:
+			out["ticket_id"] = out.pop("id")
+
+		if name in {"fetch_tickets", "aggregate_tickets"}:
+			filters = out.get("filters") or {}
+			if isinstance(filters, dict):
+				f = {}
+				if "priority" in filters:
+					f_priority = normalize_priority(filters.get("priority"))
+					if f_priority:
+						f["priority"] = f_priority
+				if "sentiment" in filters:
+					f_sent = normalize_sentiment(filters.get("sentiment"))
+					if f_sent:
+						f["sentiment"] = f_sent
+				if "status" in filters:
+					f["status"] = str(filters.get("status"))
+				out["filters"] = f
+
+		if name == "search_tickets":
+			out["query"] = str(out.get("query", ""))
+
+		if name == "update_ticket":
+			updates = out.get("updates") or {}
+			if isinstance(updates, dict):
+				cls = updates.get("classification") or {}
+				if isinstance(cls, dict):
+					if "priority" in cls:
+						cls["priority"] = normalize_priority(cls.get("priority")) or cls.get("priority")
+					if "sentiment" in cls:
+						cls["sentiment"] = normalize_sentiment(cls.get("sentiment")) or cls.get("sentiment")
+					if "topic_tags" in cls and isinstance(cls.get("topic_tags"), list):
+						cls["topic_tags"] = normalize_topic_tags(cls.get("topic_tags"))
+					updates["classification"] = cls
+				out["updates"] = updates
+
+	except Exception:
+		return args
+	return out
+
+
 def run_agent(user_message: str, conversation: List[ConversationMessage], system_instruction: str | None = None) -> Dict[str, Any]:
 	"""Run Gemini agent with possible tool-calling loop.
 
@@ -573,6 +662,13 @@ def run_agent(user_message: str, conversation: List[ConversationMessage], system
 					args = dict(raw_args)
 			except Exception:
 				args = {}
+
+			# Normalize common filter/value variants so tools receive canonical values
+			try:
+				args = _normalize_tool_args(name, args)
+			except Exception:
+				# If normalization fails, continue with raw args
+				pass
 			func = TOOL_REGISTRY.get(name)
 			if not func:
 				result = {"error": f"Unknown tool {name}"}
@@ -624,6 +720,7 @@ def build_system_instruction(ticket: Optional[TicketResponse]) -> str:
 		"- delete_ticket(ticket_id): remove a ticket (only if user explicitly requests deletion).\n"
 		"USAGE PATTERNS:\n"
 		"* When user asks analytics (e.g., 'list P0 tickets', 'how many negative sentiment tickets?'): call fetch_tickets (maybe multiple times) then summarize.\n"
+		"CANONICAL FILTER VALUES: For priority use exactly one of 'P0 (High)', 'P1 (Medium)', 'P2 (Low)'. For sentiment use exactly one of 'Positive', 'Neutral', 'Negative'. When passing filters to tools, supply a JSON object under the 'filters' key, e.g. {\"filters\": {\"priority\": \"P1 (Medium)\"}}.\n"
 		"* When user references a ticket id: use get_ticket for precise data.\n"
 		"* For keyword queries (e.g., 'tickets about snowflake'): call search_tickets.\n"
 		"* Only call update_ticket if the user explicitly asks to change something or if classification is clearly wrong.\n"
